@@ -36,6 +36,7 @@ type GatewayRequestContextParams = {
   sessionObserver: SessionObserverService;
   getMcpAppSandboxPort?: GatewayRequestContext["getMcpAppSandboxPort"];
   ensureSandboxHostPort?: GatewayRequestContext["ensureSandboxHostPort"];
+  getPortalService?: () => GatewayRequestContext["portalService"];
   resolveTerminalLaunchPolicy: GatewayRequestContext["resolveTerminalLaunchPolicy"];
   isTerminalEnabled: GatewayRequestContext["isTerminalEnabled"];
   execApprovalManager: GatewayRequestContext["execApprovalManager"];
@@ -183,6 +184,9 @@ export function createGatewayRequestContext(
     notifyPluginMetadataChanged: params.notifyPluginMetadataChanged,
     getMcpAppSandboxPort: params.getMcpAppSandboxPort,
     ensureSandboxHostPort: params.ensureSandboxHostPort,
+    get portalService() {
+      return params.getPortalService?.();
+    },
     resolveTerminalLaunchPolicy: params.resolveTerminalLaunchPolicy,
     isTerminalEnabled: params.isTerminalEnabled,
     execApprovalManager: params.execApprovalManager,
