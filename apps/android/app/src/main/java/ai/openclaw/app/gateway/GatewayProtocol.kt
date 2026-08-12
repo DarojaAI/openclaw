@@ -574,6 +574,9 @@ enum class GatewayMethod(
   ProjectsSearchRemote("projects.searchRemote"),
   DesktopObserve("desktop.observe"),
   DesktopLaunch("desktop.launch"),
+  PortalList("portal.list"),
+  PortalOpen("portal.open"),
+  PortalClose("portal.close"),
 }
 
 enum class GatewayEvent(
@@ -624,5 +627,6 @@ enum class GatewayEvent(
   OpenclawApprovalResolved("openclaw.approval.resolved"),
   TerminalData("terminal.data"),
   TerminalExit("terminal.exit"),
+  PortalChanged("portal.changed"),
   UpdateAvailable("update.available"),
 }
