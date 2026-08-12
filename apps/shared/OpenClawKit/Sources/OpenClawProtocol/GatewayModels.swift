@@ -18991,6 +18991,7 @@ public struct PortalSummary: Codable, Sendable {
     public let listenport: Int
     public let tokenquery: String
     public let url: String
+    public let publicurl: String
     public let path: String?
     public let description: String?
     public let createdatms: Int
@@ -19002,6 +19003,7 @@ public struct PortalSummary: Codable, Sendable {
         listenport: Int,
         tokenquery: String,
         url: String,
+        publicurl: String,
         path: String? = nil,
         description: String? = nil,
         createdatms: Int)
@@ -19012,6 +19014,7 @@ public struct PortalSummary: Codable, Sendable {
         self.listenport = listenport
         self.tokenquery = tokenquery
         self.url = url
+        self.publicurl = publicurl
         self.path = path
         self.description = description
         self.createdatms = createdatms
@@ -19024,6 +19027,7 @@ public struct PortalSummary: Codable, Sendable {
         case listenport = "listenPort"
         case tokenquery = "tokenQuery"
         case url
+        case publicurl = "publicUrl"
         case path
         case description
         case createdatms = "createdAtMs"
@@ -19079,6 +19083,7 @@ public struct PortalOpenResult: Codable, Sendable {
     public let listenport: Int
     public let tokenquery: String
     public let url: String
+    public let publicurl: String
     public let path: String?
     public let description: String?
     public let createdatms: Int
@@ -19090,6 +19095,7 @@ public struct PortalOpenResult: Codable, Sendable {
         listenport: Int,
         tokenquery: String,
         url: String,
+        publicurl: String,
         path: String? = nil,
         description: String? = nil,
         createdatms: Int)
@@ -19100,6 +19106,7 @@ public struct PortalOpenResult: Codable, Sendable {
         self.listenport = listenport
         self.tokenquery = tokenquery
         self.url = url
+        self.publicurl = publicurl
         self.path = path
         self.description = description
         self.createdatms = createdatms
@@ -19112,6 +19119,7 @@ public struct PortalOpenResult: Codable, Sendable {
         case listenport = "listenPort"
         case tokenquery = "tokenQuery"
         case url
+        case publicurl = "publicUrl"
         case path
         case description
         case createdatms = "createdAtMs"
