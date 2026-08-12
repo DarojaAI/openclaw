@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import { appendTranscriptTurn } from "../../system-agent/transcript-store.js";
 import {
   appendSystemAgentRecoveryHistory,
+  persistSystemAgentEngineHistory,
   setSystemAgentRecoveryHistory,
   systemAgentChatHistoryHandler,
 } from "./system-agent-chat-history.js";
@@ -15,10 +17,12 @@ const turns = [
 ];
 
 const transcriptStoreMocks = vi.hoisted(() => ({
+  appendTranscriptTurn: vi.fn(),
   readTranscriptTail: vi.fn(),
 }));
 
 vi.mock("../../system-agent/transcript-store.js", () => ({
+  appendTranscriptTurn: transcriptStoreMocks.appendTranscriptTurn,
   readTranscriptTail: transcriptStoreMocks.readTranscriptTail,
 }));
 
@@ -62,7 +66,62 @@ function makeInvocation(params: {
 
 describe("openclaw.chat.history wizard recovery", () => {
   beforeEach(() => {
+    transcriptStoreMocks.appendTranscriptTurn.mockReset();
     transcriptStoreMocks.readTranscriptTail.mockReset().mockReturnValue(turns);
+  });
+
+  it("keeps accepted action metadata on live recovery turns only", () => {
+    const wizardAction = {
+      kind: "cancel" as const,
+    };
+    const recoveryTurns = persistSystemAgentEngineHistory(
+      {
+        historySince: () => [
+          { role: "user", text: "Cancel" },
+          { role: "assistant", text: "Twitch setup cancelled." },
+        ],
+      },
+      0,
+      { wizardAction, wizardActionAccepted: true },
+    );
+
+    expect(recoveryTurns).toEqual([
+      expect.objectContaining({
+        role: "user",
+        wizardAction,
+      }),
+      expect.objectContaining({
+        role: "assistant",
+      }),
+    ]);
+    expect(vi.mocked(appendTranscriptTurn).mock.calls.map(([turn]) => turn)).toEqual([
+      expect.objectContaining({ role: "user", text: "Cancel" }),
+      expect.objectContaining({ role: "assistant", text: "Twitch setup cancelled." }),
+    ]);
+    for (const [turn] of vi.mocked(appendTranscriptTurn).mock.calls) {
+      expect(turn).not.toHaveProperty("wizardAction");
+    }
+  });
+
+  it("omits action metadata when the engine rejects the typed answer", () => {
+    persistSystemAgentEngineHistory(
+      {
+        historySince: () => [
+          { role: "user", text: "Invalid value" },
+          { role: "assistant", text: "Choose again." },
+        ],
+      },
+      0,
+      {
+        wizardAction: { kind: "answer", prompt: "Port" },
+        wizardActionAccepted: false,
+      },
+    );
+
+    expect(vi.mocked(appendTranscriptTurn)).toHaveBeenCalledTimes(2);
+    for (const [turn] of vi.mocked(appendTranscriptTurn).mock.calls) {
+      expect(turn).not.toHaveProperty("wizardAction");
+    }
   });
 
   it("returns an active wizard only to its bound owner", async () => {

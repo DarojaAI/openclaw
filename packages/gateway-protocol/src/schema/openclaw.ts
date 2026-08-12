@@ -86,6 +86,8 @@ export const SystemAgentChatResultSchema = closedObject({
   sensitive: Type.Optional(Type.Boolean()),
   /** The hosted wizard will consume the next message as its current step answer. */
   wizardInputPending: Type.Optional(Type.Boolean()),
+  /** Whether the submitted typed wizard action passed owner-side validation. */
+  wizardActionAccepted: Type.Optional(Type.Boolean()),
   action: Type.Union([
     Type.Literal("none"),
     // The user asked to talk to their agent; clients should move to their
@@ -113,10 +115,18 @@ export const SystemAgentChatHistoryParamsSchema = closedObject({
   sessionId: Type.Optional(NonEmptyString),
 });
 
+export const SystemAgentChatHistoryWizardActionSchema = closedObject({
+  kind: Type.Union([Type.Literal("answer"), Type.Literal("cancel")]),
+  /** Ordinary non-sensitive prompt copy used to label the receipt. */
+  prompt: Type.Optional(Type.String()),
+});
+
 export const SystemAgentChatHistoryTurnSchema = closedObject({
   role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
   text: Type.String(),
   at: Type.Number(),
+  /** Present only on accepted typed controls from a live recovered session. */
+  wizardAction: Type.Optional(SystemAgentChatHistoryWizardActionSchema),
 });
 
 export const SystemAgentChatHistoryResultSchema = closedObject({
@@ -379,6 +389,9 @@ export type SystemAgentWizardCancel = Static<typeof SystemAgentWizardCancelSchem
 export type SystemAgentChatQuestion = Static<typeof SystemAgentChatQuestionSchema>;
 export type SystemAgentChatResult = Static<typeof SystemAgentChatResultSchema>;
 export type SystemAgentChatHistoryParams = Static<typeof SystemAgentChatHistoryParamsSchema>;
+export type SystemAgentChatHistoryWizardAction = Static<
+  typeof SystemAgentChatHistoryWizardActionSchema
+>;
 export type SystemAgentChatHistoryTurn = Static<typeof SystemAgentChatHistoryTurnSchema>;
 export type SystemAgentChatHistoryResult = Static<typeof SystemAgentChatHistoryResultSchema>;
 export type SystemChangeEntry = Static<typeof SystemChangeEntrySchema>;

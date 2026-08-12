@@ -275,6 +275,63 @@ openclaw-custodian-page {
   background: var(--bg-elevated);
 }
 
+.custodian__structured-response {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin: 0 16px 14px 46px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+}
+
+.custodian__structured-response-icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+
+.custodian__structured-response-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.custodian__structured-response-icon--cancelled {
+  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  color: var(--text-muted);
+}
+
+.custodian__structured-response-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.custodian__structured-response-copy strong {
+  overflow-wrap: anywhere;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.custodian__structured-response-prompt {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.custodian__structured-response-status {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .custodian__wizard-title {
   color: var(--text-strong);
   font-size: 14px;
@@ -518,7 +575,8 @@ openclaw-custodian-page {
 
 @media (max-width: 400px) {
   .custodian__option-card,
-  .custodian__wizard-step {
+  .custodian__wizard-step,
+  .custodian__structured-response {
     margin-left: 0;
   }
 }

@@ -1,10 +1,11 @@
 import {
   validateSystemAgentChatHistoryParams,
   type SystemAgentChatHistoryTurn,
+  type SystemAgentChatHistoryWizardAction,
 } from "../../../packages/gateway-protocol/src/index.js";
 import type { SystemAgentChatEngine } from "../../system-agent/chat-engine.js";
 import { resolveSystemAgentDelegationKey } from "../../system-agent/delegation-session.js";
-import { readTranscriptTail } from "../../system-agent/transcript-store.js";
+import { appendTranscriptTurn, readTranscriptTail } from "../../system-agent/transcript-store.js";
 import { runSystemAgentGatewayTask } from "./system-agent-gateway-queue.js";
 import { getSystemAgentSessionQueue } from "./system-agent-session-queue.js";
 import type { GatewayClient, GatewayRequestHandler } from "./types.js";
@@ -34,6 +35,29 @@ function readSystemAgentRecoveryHistory(
   limit = DEFAULT_SYSTEM_AGENT_HISTORY_LIMIT,
 ): SystemAgentChatHistoryTurn[] {
   return (recoveryTurnsByEngine.get(engine) ?? []).slice(-limit);
+}
+
+export function persistSystemAgentEngineHistory(
+  engine: Pick<SystemAgentChatEngine, "historySince">,
+  startIndex: number,
+  params: {
+    wizardAction?: SystemAgentChatHistoryWizardAction;
+    wizardActionAccepted?: boolean;
+  } = {},
+): SystemAgentChatHistoryTurn[] {
+  const at = Date.now();
+  let wizardAction = params.wizardActionAccepted === true ? params.wizardAction : undefined;
+  const recoveryTurns: SystemAgentChatHistoryTurn[] = [];
+  for (const turn of engine.historySince(startIndex)) {
+    const action = turn.role === "user" ? wizardAction : undefined;
+    const recoveryTurn = { ...turn, at, ...(action ? { wizardAction: action } : {}) };
+    appendTranscriptTurn({ ...turn, at });
+    recoveryTurns.push(recoveryTurn);
+    if (action) {
+      wizardAction = undefined;
+    }
+  }
+  return recoveryTurns;
 }
 
 export function resolveSystemAgentSessionOwnerKey(params: {

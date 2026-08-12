@@ -5,6 +5,7 @@ import type {
 import { html, nothing } from "lit";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { WizardStep } from "../../api/types.ts";
+import { icons } from "../../components/icons.ts";
 import { renderWizardStepControls } from "../../components/wizard-step-controls.ts";
 import { t } from "../../i18n/index.ts";
 import type { MessageGroup } from "../../lib/chat/chat-types.ts";
@@ -22,6 +23,14 @@ export type CustodianMessage = {
   at: number;
   question: CustodianStructuredQuestion | null;
   step: WizardStep | null;
+  structuredResponse: CustodianStructuredResponse | null;
+};
+
+export type CustodianStructuredResponse = {
+  display: string;
+  kind: "answer" | "cancel";
+  prompt?: string;
+  state: "submitting" | "submitted";
 };
 
 export function hasUnresolvedCustodianQuestion(
@@ -99,7 +108,7 @@ async function readCustodianTranscript(
 
 /**
  * Sensitive turns are masked server-side before persistence: the engine pushes
- * only "<redacted secret>" into history (never raw input), so durable turns
+ * only "<redacted secret>" into history (never raw input), so returned turns
  * cannot carry credentials. This mapping only localizes that marker to the
  * same display text live sensitive replies use.
  */
@@ -108,19 +117,65 @@ const SERVER_SENSITIVE_MASK = "<redacted secret>";
 function createCustodianTranscriptMessages(
   turns: readonly SystemAgentChatHistoryTurn[],
   firstMessageId: number,
+  activeWizard?: SystemAgentChatHistoryResult["activeWizard"],
 ): { messages: CustodianMessage[]; nextMessageId: number } {
   let nextMessageId = firstMessageId;
-  const messages = turns.map((turn) => ({
-    id: nextMessageId++,
-    role: turn.role,
-    text:
+  const messages: CustodianMessage[] = [];
+  for (const turn of turns) {
+    const display =
       turn.role === "user" && turn.text === SERVER_SENSITIVE_MASK
         ? t("custodian.sensitiveReply")
-        : turn.text,
-    at: turn.at,
-    question: null,
-    step: null,
-  }));
+        : turn.text;
+    if (turn.role === "user" && turn.wizardAction) {
+      const previous = messages.at(-1);
+      const supportingText = previous?.role === "assistant" ? previous.text : "";
+      if (supportingText) {
+        messages.pop();
+      }
+      messages.push({
+        id: nextMessageId++,
+        role: "assistant",
+        text: supportingText,
+        at: turn.at,
+        question: null,
+        step: null,
+        structuredResponse: {
+          display,
+          kind: turn.wizardAction.kind,
+          state: "submitted",
+          ...(turn.wizardAction.prompt ? { prompt: turn.wizardAction.prompt } : {}),
+        },
+      });
+      continue;
+    }
+    messages.push({
+      id: nextMessageId++,
+      role: turn.role,
+      text: display,
+      at: turn.at,
+      question: null,
+      step: null,
+      structuredResponse: null,
+    });
+  }
+  if (activeWizard) {
+    const activePrompt = messages.findLast(
+      (message) => message.role === "assistant" && message.structuredResponse === null,
+    );
+    if (activePrompt) {
+      activePrompt.step = activeWizard.step;
+    } else {
+      messages.push({
+        id: nextMessageId++,
+        role: "assistant",
+        text: "",
+        at: Date.now(),
+        question: null,
+        step: activeWizard.step,
+        structuredResponse: null,
+      });
+    }
+  }
   return { messages, nextMessageId };
 }
 
@@ -137,21 +192,15 @@ export async function loadCustodianTranscriptSnapshot(
   sessionId?: string,
 ): Promise<CustodianTranscriptSnapshot> {
   const history = await readCustodianTranscript(client, sessionId);
-  const transcript = createCustodianTranscriptMessages(history.turns, firstMessageId);
+  const transcript = createCustodianTranscriptMessages(
+    history.turns,
+    firstMessageId,
+    sessionId && history.activeWizard?.sessionId === sessionId ? history.activeWizard : undefined,
+  );
   const earlierBoundaryAfterId = transcript.messages.at(-1)?.id ?? null;
   const activeWizard = history.activeWizard;
   const recoveredStep =
     sessionId && activeWizard?.sessionId === sessionId ? activeWizard.step : null;
-  if (recoveredStep) {
-    transcript.messages.push({
-      id: transcript.nextMessageId++,
-      role: "assistant",
-      text: "",
-      at: Date.now(),
-      question: null,
-      step: recoveredStep,
-    });
-  }
   return {
     ...transcript,
     earlierBoundaryAfterId,
@@ -168,6 +217,49 @@ function renderCustodianEarlierDivider(message: CustodianMessage, boundaryAfterI
         timestamp: message.at,
       })
     : nothing;
+}
+
+function structuredPrompt(message: CustodianMessage): string {
+  return (
+    message.structuredResponse?.prompt ??
+    message.step?.title ??
+    message.step?.message ??
+    message.question?.question ??
+    t("custodian.structured.response")
+  );
+}
+
+function renderStructuredResponse(message: CustodianMessage) {
+  const response = message.structuredResponse;
+  if (!response) {
+    return nothing;
+  }
+  const cancelled = response.kind === "cancel";
+  const status = cancelled
+    ? response.state === "submitting"
+      ? t("custodian.structured.cancelling")
+      : t("custodian.structured.cancelled")
+    : response.state === "submitting"
+      ? t("custodian.structured.submitting")
+      : t("custodian.structured.submitted");
+  return html`<section
+    class="custodian__structured-response"
+    aria-label=${t("custodian.structured.response")}
+    aria-busy=${response.state === "submitting" ? "true" : "false"}
+  >
+    <span
+      class="custodian__structured-response-icon ${cancelled
+        ? "custodian__structured-response-icon--cancelled"
+        : ""}"
+      aria-hidden="true"
+      >${cancelled ? icons.stop : icons.check}</span
+    >
+    <span class="custodian__structured-response-copy">
+      <span class="custodian__structured-response-prompt">${structuredPrompt(message)}</span>
+      <strong>${response.display}</strong>
+      <span class="custodian__structured-response-status">${status}</span>
+    </span>
+  </section>`;
 }
 
 export function renderCustodianTranscriptEntry(params: {
@@ -190,8 +282,11 @@ export function renderCustodianTranscriptEntry(params: {
 }) {
   const question = params.message.question;
   const step = params.message.step;
+  const hasStructuredResponse = params.message.structuredResponse !== null;
+  const hasActiveWizardStep = params.showWizardStep && step !== null;
+  const showTranscriptMessage = params.message.text && !hasStructuredResponse;
   return html`
-    ${params.message.text
+    ${showTranscriptMessage
       ? renderMessageGroup(toCustodianMessageGroup(params.message), {
           showReasoning: false,
           showToolCalls: false,
@@ -200,15 +295,17 @@ export function renderCustodianTranscriptEntry(params: {
         })
       : nothing}
     ${renderCustodianEarlierDivider(params.message, params.boundaryAfterId)}
-    ${params.showQuestion && question
-      ? renderCustodianQuestionCard({
-          question,
-          disabled: params.questionDisabled,
-          onSelect: params.onSelect,
-          onSkip: params.onSkip,
-        })
-      : nothing}
-    ${params.showWizardStep && step
+    ${hasStructuredResponse
+      ? renderStructuredResponse(params.message)
+      : params.showQuestion && question
+        ? renderCustodianQuestionCard({
+            question,
+            disabled: params.questionDisabled,
+            onSelect: params.onSelect,
+            onSkip: params.onSkip,
+          })
+        : nothing}
+    ${hasActiveWizardStep && !hasStructuredResponse && step
       ? html`<section
           class="custodian__wizard-step"
           aria-label=${step.title ?? step.message ?? "Setup"}

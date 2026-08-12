@@ -57,7 +57,6 @@ describe("custodian page", () => {
         .querySelector<HTMLImageElement>("img.chat-avatar.assistant")
         ?.getAttribute("src"),
     ).toBe("/favicon.svg");
-    // Onboarding strips the header identity; the thread avatar is the only mascot.
     expect(page.querySelector(".custodian__mark openclaw-mascot")).toBeNull();
     const card = page.querySelector("openclaw-option-card")!;
     await card.updateComplete;
@@ -71,13 +70,11 @@ describe("custodian page", () => {
     await page.updateComplete;
     expect(request.mock.calls[0]?.[0]).toBe("openclaw.chat");
     expect(request.mock.calls[0]?.[1]).toMatchObject({ welcomeVariant: "onboarding" });
-    // LLM-authored option cards remain chat messages; wizard controls use wizardAnswer below.
     expect(request.mock.calls[1]?.[1]).toMatchObject({
       welcomeVariant: "onboarding",
       message: "connect whatsapp",
     });
-    const userGroup = page.querySelector<HTMLElement>(".chat-group.user")!;
-    expect(userGroup.textContent).toContain("Connect WhatsApp");
+    expect(page.querySelector(".chat-group.user")?.textContent).toContain("Connect WhatsApp");
     expect(connectOption.disabled).toBe(true);
   });
 
@@ -103,6 +100,7 @@ describe("custodian page", () => {
         sessionId: "rich-wizard-session",
         reply: "Choose features.",
         action: "none",
+        wizardActionAccepted: true,
         wizardInputPending: true,
         step: {
           id: "features",
@@ -119,6 +117,7 @@ describe("custodian page", () => {
         sessionId: "rich-wizard-session",
         reply: "Enter the secret.",
         action: "none",
+        wizardActionAccepted: true,
         sensitive: true,
         wizardInputPending: true,
         step: {
@@ -132,6 +131,7 @@ describe("custodian page", () => {
         sessionId: "rich-wizard-session",
         reply: "Setup complete.",
         action: "none",
+        wizardActionAccepted: true,
       });
     const { context } = createContext(request);
     const { page } = await mountPage(context);
@@ -139,6 +139,7 @@ describe("custodian page", () => {
     await waitForFast(() =>
       expect(page.querySelectorAll('.custodian__wizard-step input[type="radio"]')).toHaveLength(5),
     );
+    expect(page.querySelector(".chat-group.assistant")?.textContent).toContain("Choose a channel.");
     expect(page.querySelector("openclaw-option-card")).toBeNull();
     expect(page.querySelector(".agent-chat__composer-shell")).toBeNull();
     page
@@ -169,7 +170,9 @@ describe("custodian page", () => {
 
     await waitForFast(() => expect(request).toHaveBeenCalledTimes(3));
     const secretInput = await waitForFast(() => {
-      const input = page.querySelector<HTMLInputElement>("#custodian-wizard-input-5");
+      const input = page.querySelector<HTMLInputElement>(
+        '.custodian__wizard-step input[name="wizard-text"]',
+      );
       expect(input).not.toBeNull();
       return input!;
     });
@@ -183,7 +186,9 @@ describe("custodian page", () => {
     expect(revealSecret).not.toBeNull();
     revealSecret!.click();
     await page.updateComplete;
-    const revealedInput = page.querySelector<HTMLInputElement>("#custodian-wizard-input-5")!;
+    const revealedInput = page.querySelector<HTMLInputElement>(
+      '.custodian__wizard-step input[name="wizard-text"]',
+    )!;
     expect(revealedInput.type).toBe("text");
     revealedInput.value = "fake-client-secret";
     revealedInput.dispatchEvent(new Event("input", { bubbles: true }));
@@ -199,6 +204,8 @@ describe("custodian page", () => {
     expect(page.textContent).toContain("Twitch");
     expect(page.textContent).toContain("Chat, Announcements");
     expect(page.textContent).toContain("Sensitive reply sent");
+    expect(page.querySelectorAll(".custodian__structured-response")).toHaveLength(3);
+    expect(page.querySelector(".chat-group.user")).toBeNull();
     expect(page.textContent).not.toContain("fake-client-secret");
     expect(page.querySelector(".agent-chat__composer-shell")).not.toBeNull();
   });
@@ -223,6 +230,7 @@ describe("custodian page", () => {
         sessionId: "cancel-wizard-session",
         reply: "Channel setup cancelled.",
         action: "none",
+        wizardActionAccepted: true,
       });
     const { context } = createContext(request);
     const { page } = await mountPage(context);
@@ -245,6 +253,15 @@ describe("custodian page", () => {
     expect(request.mock.calls[1]?.[1]).not.toHaveProperty("message");
     await waitForFast(() => expect(page.textContent).toContain("Channel setup cancelled."));
     expect(page.querySelector(".custodian__wizard-step")).toBeNull();
+    expect(page.querySelector(".chat-group.user")).toBeNull();
+    expect(page.querySelector(".custodian__structured-response")?.textContent).toContain("Cancel");
+    expect(page.querySelector(".custodian__structured-response")?.textContent).toContain(
+      "Setup cancelled",
+    );
+    const cancellationStatus = page.querySelector(".custodian__structured-response-status");
+    expect(cancellationStatus?.textContent).toBe("Setup cancelled");
+    expect(cancellationStatus?.classList.contains("sr-only")).toBe(false);
+    expect(page.querySelector(".custodian__structured-response-icon--cancelled")).not.toBeNull();
     expect(page.querySelector(".agent-chat__composer-shell")).not.toBeNull();
   });
 

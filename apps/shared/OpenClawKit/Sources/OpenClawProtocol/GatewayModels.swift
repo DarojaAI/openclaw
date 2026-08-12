@@ -10760,6 +10760,7 @@ public struct SystemAgentChatResult: Codable, Sendable {
     public let reply: String
     public let sensitive: Bool?
     public let wizardinputpending: Bool?
+    public let wizardactionaccepted: Bool?
     public let action: AnyCodable
     public let agentdraft: String?
     public let agentid: String?
@@ -10773,6 +10774,7 @@ public struct SystemAgentChatResult: Codable, Sendable {
         reply: String,
         sensitive: Bool? = nil,
         wizardinputpending: Bool? = nil,
+        wizardactionaccepted: Bool? = nil,
         action: AnyCodable,
         agentdraft: String? = nil,
         agentid: String? = nil,
@@ -10785,6 +10787,7 @@ public struct SystemAgentChatResult: Codable, Sendable {
         self.reply = reply
         self.sensitive = sensitive
         self.wizardinputpending = wizardinputpending
+        self.wizardactionaccepted = wizardactionaccepted
         self.action = action
         self.agentdraft = agentdraft
         self.agentid = agentid
@@ -10799,6 +10802,7 @@ public struct SystemAgentChatResult: Codable, Sendable {
         case reply
         case sensitive
         case wizardinputpending = "wizardInputPending"
+        case wizardactionaccepted = "wizardActionAccepted"
         case action
         case agentdraft = "agentDraft"
         case agentid = "agentId"
@@ -10831,21 +10835,25 @@ public struct SystemAgentChatHistoryTurn: Codable, Sendable {
     public let role: AnyCodable
     public let text: String
     public let at: Double
+    public let wizardaction: [String: AnyCodable]?
 
     public init(
         role: AnyCodable,
         text: String,
-        at: Double)
+        at: Double,
+        wizardaction: [String: AnyCodable]? = nil)
     {
         self.role = role
         self.text = text
         self.at = at
+        self.wizardaction = wizardaction
     }
 
     private enum CodingKeys: String, CodingKey {
         case role
         case text
         case at
+        case wizardaction = "wizardAction"
     }
 }
 

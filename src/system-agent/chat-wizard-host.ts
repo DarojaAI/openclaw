@@ -1,5 +1,6 @@
 import type {
   SystemAgentChatQuestion,
+  SystemAgentChatHistoryWizardAction,
   SystemAgentWizardCancel,
   WizardAnswer,
 } from "../../packages/gateway-protocol/src/index.js";
@@ -30,6 +31,9 @@ export type SystemAgentChatReply = {
   agentDraft?: "hatch";
   sensitive?: boolean;
   wizardInputPending?: boolean;
+  /** The submitted typed wizard action passed or failed owner-side validation. */
+  wizardActionAccepted?: boolean;
+  wizardAction?: SystemAgentChatHistoryWizardAction;
   handoff?: SystemAgentOperation;
   question?: SystemAgentChatQuestion;
   step?: WizardStep;
@@ -42,8 +46,21 @@ export type ChatWizardResult = {
 };
 
 export type ChatWizardAnswerResult = ChatWizardResult & {
+  accepted: boolean;
   userHistoryText: string;
+  wizardAction: SystemAgentChatHistoryWizardAction;
 };
+
+function wizardActionReceipt(
+  step: WizardStep,
+  kind: SystemAgentChatHistoryWizardAction["kind"],
+): SystemAgentChatHistoryWizardAction {
+  const prompt =
+    !step.sensitive && !step.deviceCode && !step.externalUrl
+      ? (step.title ?? step.message)
+      : undefined;
+  return { kind, ...(prompt ? { prompt } : {}) };
+}
 
 export type ChatWizardHostDependencies = {
   runChannelSetupWizard?: (
@@ -311,7 +328,9 @@ export class ChatWizardHost {
       : await this.pump();
     return {
       ...result,
+      accepted: validationError === undefined,
       userHistoryText: formatStructuredWizardAnswerForHistory(step, answer.value),
+      wizardAction: wizardActionReceipt(step, "answer"),
     };
   }
 
@@ -327,7 +346,12 @@ export class ChatWizardHost {
     if (!bridge.session.cancel()) {
       throw new SystemAgentWizardAnswerError("The hosted wizard cannot be cancelled right now.");
     }
-    return { ...(await this.pump()), userHistoryText: "Cancel" };
+    return {
+      ...(await this.pump()),
+      accepted: true,
+      userHistoryText: "Cancel",
+      wizardAction: wizardActionReceipt(step, "cancel"),
+    };
   }
 
   async resolveReply(text: string): Promise<ChatWizardResult> {

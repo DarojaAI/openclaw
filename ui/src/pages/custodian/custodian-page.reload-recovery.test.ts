@@ -16,6 +16,7 @@ const recoveryOwner = { gatewayUrl, recoveryScope };
 const recoveryClient = { recoveryScope, recoveryScopeReady: true } as never;
 const recoveryCapabilities = [
   GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL,
+  GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_ACTION_RECEIPTS,
   GATEWAY_SERVER_CAPS.SYSTEM_AGENT_CHAT_HISTORY_SESSION_RECOVERY,
 ];
 
@@ -34,8 +35,46 @@ describe("Custodian wizard reload recovery", () => {
         if (params.sessionId === "live-wizard" && !cancelled) {
           return {
             turns: [
+              {
+                role: "assistant",
+                text: "Choose a previous channel.",
+                at: 0,
+              },
+              {
+                role: "user",
+                text: "Cancel",
+                at: 0,
+                wizardAction: {
+                  kind: "cancel",
+                  prompt: "Choose a previous channel.",
+                },
+              },
               { role: "user", text: "connect twitch", at: 1 },
-              { role: "assistant", text: "Enter the secret.", at: 2 },
+              {
+                role: "assistant",
+                text: [
+                  "How should OpenClaw appear in Twitch?",
+                  "1. Bot",
+                  "2. User",
+                  "Reply with a number.",
+                  "Say `cancel` to stop this setup.",
+                ].join("\n"),
+                at: 2,
+              },
+              {
+                role: "user",
+                text: "Bot",
+                at: 3,
+                wizardAction: {
+                  kind: "answer",
+                  prompt: "How should OpenClaw appear in Twitch?",
+                },
+              },
+              {
+                role: "assistant",
+                text: "Enter the secret.\nType your answer.\nSay `cancel` to stop this setup.",
+                at: 4,
+              },
             ],
             activeWizard: {
               sessionId: "live-wizard",
@@ -59,6 +98,7 @@ describe("Custodian wizard reload recovery", () => {
           sessionId: "live-wizard",
           reply: "Twitch setup cancelled.",
           action: "none",
+          wizardActionAccepted: true,
         };
       }
       freshChatCount += 1;
@@ -99,6 +139,16 @@ describe("Custodian wizard reload recovery", () => {
     });
     expect(recoveredInput.value).toBe("");
     expect(second.page.textContent).toContain("Enter the secret.");
+    expect(second.page.querySelectorAll(".custodian__structured-response")).toHaveLength(2);
+    expect(
+      second.page.querySelector(".custodian__structured-response-icon--cancelled"),
+    ).not.toBeNull();
+    expect(second.page.textContent).toContain("Setup cancelled");
+    expect(
+      second.page.querySelectorAll(".custodian__structured-response")[1]?.textContent,
+    ).toContain("Bot");
+    expect(second.page.querySelector(".chat-group.user")?.textContent).toContain("connect twitch");
+    expect(second.page.querySelector("details")).toBeNull();
     expect(request.mock.calls.filter(([method]) => method === "openclaw.chat")).toHaveLength(1);
 
     second.page.querySelector<HTMLButtonElement>(".custodian__wizard-cancel")!.click();
@@ -107,12 +157,127 @@ describe("Custodian wizard reload recovery", () => {
       sessionId: "live-wizard",
       wizardCancel: { stepId: "secret" },
     });
+    expect(second.page.querySelector(".chat-group.user")?.textContent).not.toContain("Cancel");
+    expect(second.page.querySelectorAll(".custodian__structured-response")).toHaveLength(3);
     expect(readCustodianRecoveryForClient(recoveryClient, gatewayUrl)).toBeNull();
 
     second.provider.remove();
     const third = await mountPage(context);
     await waitForFast(() => expect(third.page.textContent).toContain("Fresh session ready."));
     expect(third.page.querySelector(".custodian__wizard-step")).toBeNull();
+  });
+
+  it("restores ordinary question answers as user turns instead of wizard receipts", async () => {
+    reconcileCustodianRecoveryForScope(
+      recoveryOwner,
+      {
+        sessionId: "ordinary-answer-session",
+        reply: "Choose a channel.",
+        action: "none",
+        wizardInputPending: true,
+        step: {
+          id: "channel",
+          type: "select",
+          message: "Which channel?",
+          options: [{ label: "WhatsApp", value: "whatsapp" }],
+        },
+      },
+      "ordinary-answer-session",
+    );
+    const request = vi.fn(async (method: string) => {
+      if (method !== "openclaw.chat.history") {
+        throw new Error(`unexpected method ${method}`);
+      }
+      return {
+        turns: [
+          {
+            role: "assistant",
+            text: "What would you like to do first?",
+            at: 1,
+          },
+          {
+            role: "user",
+            text: "Connect WhatsApp",
+            at: 2,
+          },
+          {
+            role: "assistant",
+            text: "Choose a channel.",
+            at: 3,
+          },
+        ],
+        activeWizard: {
+          sessionId: "ordinary-answer-session",
+          step: {
+            id: "channel",
+            type: "select",
+            message: "Which channel?",
+            options: [{ label: "WhatsApp", value: "whatsapp" }],
+          },
+        },
+      };
+    });
+    const { context } = createContext(request, ["openclaw.chat", "openclaw.chat.history"], {
+      gatewayCapabilities: recoveryCapabilities,
+      recoveryScope,
+    });
+    const { page } = await mountPage(context);
+
+    await waitForFast(() => expect(page.querySelector(".custodian__wizard-step")).not.toBeNull());
+    expect(page.querySelector(".chat-group.user")?.textContent).toContain("Connect WhatsApp");
+    expect(page.querySelector(".custodian__structured-response")).toBeNull();
+  });
+
+  it("restores a validation-rejected wizard answer without a completed receipt", async () => {
+    reconcileCustodianRecoveryForScope(
+      recoveryOwner,
+      {
+        sessionId: "validation-session",
+        reply: "Enter a port.",
+        action: "none",
+        wizardInputPending: true,
+        step: { id: "port", type: "text", message: "Gateway port" },
+      },
+      "validation-session",
+    );
+    const request = vi.fn(async (method: string) => {
+      if (method !== "openclaw.chat.history") {
+        throw new Error(`unexpected method ${method}`);
+      }
+      return {
+        turns: [
+          {
+            role: "assistant",
+            text: "Enter a port.",
+            at: 1,
+          },
+          {
+            role: "user",
+            text: "banana",
+            at: 2,
+          },
+          {
+            role: "assistant",
+            text: "Enter port 18789.",
+            at: 3,
+          },
+        ],
+        activeWizard: {
+          sessionId: "validation-session",
+          step: { id: "port", type: "text", message: "Gateway port" },
+        },
+      };
+    });
+    const { context } = createContext(request, ["openclaw.chat", "openclaw.chat.history"], {
+      gatewayCapabilities: recoveryCapabilities,
+      recoveryScope,
+    });
+    const { page } = await mountPage(context);
+
+    await waitForFast(() => expect(page.textContent).toContain("Enter port 18789."));
+    expect(page.querySelector(".custodian__structured-response")).toBeNull();
+    expect(page.querySelector(".chat-group.user")?.textContent).toContain("banana");
+    expect(page.querySelector(".custodian__wizard-step")).not.toBeNull();
   });
 
   it("waits for the authenticated recovery scope before starting a fresh session", async () => {

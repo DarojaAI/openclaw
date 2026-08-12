@@ -66,6 +66,7 @@ export function createContext(
         methods,
         capabilities: options.gatewayCapabilities ?? [
           GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL,
+          GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_ACTION_RECEIPTS,
         ],
       },
     },

@@ -16,11 +16,12 @@ import {
 import { buildAgentMainSessionKey, normalizeAgentId } from "../../lib/sessions/session-key.ts";
 import { pathForCustodianAgentHandoff } from "./custodian-navigation.ts";
 import { readCustodianRecoveryForClient } from "./custodian-recovery.ts";
+import { createCustodianStructuredInteraction } from "./custodian-structured-interaction.ts";
 import {
   CustodianTranscriptState,
   type CustodianTranscriptHistoryOutcome,
 } from "./custodian-transcript-state.ts";
-import { custodianWizardSubmission, initialCustodianWizardValue } from "./custodian-wizard-step.ts";
+import { initialCustodianWizardValue } from "./custodian-wizard-step.ts";
 import * as eventNudgeState from "./event-nudge.ts";
 import {
   custodianChatParams,
@@ -45,6 +46,10 @@ function hasCustodianUserInput(params: SystemAgentChatParams): boolean {
     params.wizardAnswer !== undefined ||
     params.wizardCancel !== undefined
   );
+}
+
+function hasCustodianWizardAction(params: SystemAgentChatParams): boolean {
+  return params.wizardAnswer !== undefined || params.wizardCancel !== undefined;
 }
 
 type StoreListener = () => void;
@@ -79,6 +84,23 @@ export class CustodianSessionStore extends CustodianTranscriptState {
   private agentCleanup: (() => void) | null = null;
   private eventCleanup: (() => void) | null = null;
   private readonly listeners = new Set<StoreListener>();
+  private readonly structuredInteraction = createCustodianStructuredInteraction({
+    state: () => ({
+      activeClient: this.activeClient,
+      chatAvailable: this.chatAvailable,
+      messages: this.messages,
+      sending: this.sending,
+      sessionId: this.sessionId,
+      setupRequired: this.setupRequired,
+      wizardCancelAvailable: this.wizardCancelAvailable,
+      wizardActionReceiptsAvailable: this.wizardActionReceiptsAvailable,
+      wizardInputPending: this.wizardInputPending,
+    }),
+    emit: () => this.emit(),
+    replaceMessages: (messages) => (this.messages = messages),
+    sendUserTurn: (client, params, display, appendUserMessage) =>
+      this.sendUserTurn(client, params, display, true, appendUserMessage),
+  });
 
   subscribe(listener: StoreListener): () => void {
     this.listeners.add(listener);
@@ -137,7 +159,9 @@ export class CustodianSessionStore extends CustodianTranscriptState {
   }
 
   hasRealUserTurn(): boolean {
-    return this.messages.some((message) => message.role === "user");
+    return this.messages.some(
+      (message) => message.role === "user" || message.structuredResponse !== null,
+    );
   }
 
   get activeVariant(): CustodianSessionVariant {
@@ -168,6 +192,15 @@ export class CustodianSessionStore extends CustodianTranscriptState {
         this.context?.gateway.snapshot ?? {},
         GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL,
       ) ?? false
+    );
+  }
+
+  get wizardActionReceiptsAvailable(): boolean {
+    return (
+      isGatewayCapabilityAdvertised(
+        this.context?.gateway.snapshot ?? {},
+        GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_ACTION_RECEIPTS,
+      ) === true
     );
   }
 
@@ -211,6 +244,7 @@ export class CustodianSessionStore extends CustodianTranscriptState {
     params: SystemAgentChatParams,
     displayText: string,
     questionReply: boolean,
+    appendUserMessage = true,
   ): Promise<eventNudgeState.CustodianSendOutcome> {
     const questionState = [this.answeredQuestions, this.questionReplyUncertain] as const;
     if (questionReply) {
@@ -218,17 +252,20 @@ export class CustodianSessionStore extends CustodianTranscriptState {
     }
     this.abandonedTurnOutcomeUnknown = false;
     this.answeredQuestions = retireCustodianQuestions(this.messages, this.answeredQuestions);
-    this.messages = [
-      ...this.messages,
-      {
-        id: this.nextMessageId++,
-        role: "user",
-        text: displayText,
-        at: Date.now(),
-        question: null,
-        step: null,
-      },
-    ];
+    if (appendUserMessage) {
+      this.messages = [
+        ...this.messages,
+        {
+          id: this.nextMessageId++,
+          role: "user",
+          text: displayText,
+          at: Date.now(),
+          question: null,
+          step: null,
+          structuredResponse: null,
+        },
+      ];
+    }
     this.input = "";
     this.emit();
     const reply = this.requestReply(client, params);
@@ -310,45 +347,11 @@ export class CustodianSessionStore extends CustodianTranscriptState {
   }
 
   answerWizardStep(message: CustodianMessage, value: unknown): void {
-    if (!message.step || !this.wizardInputPending) {
-      return;
-    }
-    const submission = custodianWizardSubmission(message.step, value);
-    const client = this.activeClient;
-    if (!submission || !client || !this.chatAvailable || this.sending || this.setupRequired) {
-      this.emit();
-      return;
-    }
-    const displayText = message.step.sensitive ? t("custodian.sensitiveReply") : submission.display;
-    void this.sendUserTurn(
-      client,
-      { sessionId: this.sessionId, wizardAnswer: submission.answer },
-      displayText,
-      true,
-    );
+    this.structuredInteraction.answerWizardStep(message, value);
   }
 
   cancelWizardStep(message: CustodianMessage): void {
-    const step = message.step;
-    const client = this.activeClient;
-    if (
-      !step ||
-      !this.wizardInputPending ||
-      !client ||
-      !this.chatAvailable ||
-      !this.wizardCancelAvailable ||
-      this.sending ||
-      this.setupRequired
-    ) {
-      this.emit();
-      return;
-    }
-    void this.sendUserTurn(
-      client,
-      { sessionId: this.sessionId, wizardCancel: { stepId: step.id } },
-      t("custodian.cancel"),
-      true,
-    );
+    this.structuredInteraction.cancelWizardStep(message);
   }
 
   exitSetup(): void {
@@ -704,7 +707,10 @@ export class CustodianSessionStore extends CustodianTranscriptState {
       } else if (result.action === "exit") {
         this.exitSetup();
       }
-      return "sent";
+      if (!hasCustodianWizardAction(params) || !this.wizardActionReceiptsAvailable) {
+        return "sent";
+      }
+      return result.wizardActionAccepted === true ? "accepted" : "rejected";
     } catch (error) {
       if (epoch === this.requestEpoch && client === this.activeClient) {
         this.error = custodianErrorMessage(error);

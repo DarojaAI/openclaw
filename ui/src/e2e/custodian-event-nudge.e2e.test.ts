@@ -332,7 +332,10 @@ suite.define(() => {
       },
       async ({ page }) => {
         const gateway = await installMockGateway(page, {
-          featureCapabilities: [GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL],
+          featureCapabilities: [
+            GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL,
+            GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_ACTION_RECEIPTS,
+          ],
           featureMethods: ["chat.metadata", "chat.startup", "openclaw.chat"],
           methodResponses: {
             "openclaw.chat": {
@@ -439,6 +442,7 @@ suite.define(() => {
           sessionId: "e2e-rich-wizard",
           reply: "Choose features.",
           action: "none",
+          wizardActionAccepted: true,
           wizardInputPending: true,
           step: {
             id: "features",
@@ -462,6 +466,7 @@ suite.define(() => {
           sessionId: "e2e-rich-wizard",
           reply: "Enter the secret.",
           action: "none",
+          wizardActionAccepted: true,
           sensitive: true,
           wizardInputPending: true,
           step: {
@@ -488,6 +493,7 @@ suite.define(() => {
           sessionId: "e2e-rich-wizard",
           reply: "Name this connection.",
           action: "none",
+          wizardActionAccepted: true,
           wizardInputPending: true,
           step: {
             id: "label",
@@ -522,6 +528,7 @@ suite.define(() => {
           sessionId: "e2e-rich-wizard",
           reply: "Confirm setup.",
           action: "none",
+          wizardActionAccepted: true,
           wizardInputPending: true,
           step: {
             id: "confirm",
@@ -535,22 +542,40 @@ suite.define(() => {
 
         await gateway.deferNext("openclaw.chat");
         await yesButton.click();
-        await expect.poll(() => noButton.isDisabled()).toBe(true);
-        await expect.poll(() => yesButton.isDisabled()).toBe(true);
-        await expect.poll(() => cancelButton.isDisabled()).toBe(true);
-        for (const button of [noButton, yesButton, cancelButton]) {
-          const restingStyle = await button.evaluate(readInteractionStyle);
-          await button.hover();
-          expect(await button.evaluate(readInteractionStyle)).toEqual(restingStyle);
-          expect(restingStyle.cursor).toBe("not-allowed");
+        const confirmationReceipt = page.locator(".custodian__structured-response", {
+          hasText: "Yes",
+        });
+        await confirmationReceipt.waitFor();
+        expect(
+          await confirmationReceipt.locator(".custodian__structured-response-status").textContent(),
+        ).toBe("Submitting answer");
+        expect(await noButton.count()).toBe(0);
+        expect(await yesButton.count()).toBe(0);
+
+        if (captureUiProofEnabled) {
+          await page.screenshot({
+            animations: "disabled",
+            path: path.join(uiProofArtifactDir, "06-answer-receipt-submitting-desktop.png"),
+          });
         }
 
         await gateway.resolveDeferred("openclaw.chat", {
           sessionId: "e2e-rich-wizard",
           reply: "Setup complete.",
           action: "none",
+          wizardActionAccepted: true,
         });
         await page.getByText("Setup complete.").waitFor();
+        expect(
+          await confirmationReceipt.locator(".custodian__structured-response-status").textContent(),
+        ).toBe("Answer submitted");
+
+        if (captureUiProofEnabled) {
+          await page.screenshot({
+            animations: "disabled",
+            path: path.join(uiProofArtifactDir, "07-answer-receipt-submitted-desktop.png"),
+          });
+        }
 
         const requests = await gateway.getRequests("openclaw.chat");
         expect(requests.map((request) => request.params)).toEqual([
@@ -602,6 +627,7 @@ suite.define(() => {
     const gateway = await installMockGateway(page, {
       featureCapabilities: [
         GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL,
+        GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_ACTION_RECEIPTS,
         GATEWAY_SERVER_CAPS.SYSTEM_AGENT_CHAT_HISTORY_SESSION_RECOVERY,
       ],
       featureMethods: ["chat.metadata", "chat.startup", "openclaw.chat", "openclaw.chat.history"],
@@ -680,6 +706,7 @@ suite.define(() => {
         sessionId: "e2e-reload-wizard",
         reply: "Twitch setup cancelled.",
         action: "none",
+        wizardActionAccepted: true,
       });
       await page.getByRole("button", { name: "Cancel", exact: true }).click();
       await page.getByText("Twitch setup cancelled.").waitFor();
@@ -692,6 +719,15 @@ suite.define(() => {
       });
       expect(requests[1]?.params).not.toHaveProperty("message");
       expect(await page.locator(".custodian__wizard-step").count()).toBe(0);
+      expect(await page.locator(".custodian__structured-response-status").textContent()).toBe(
+        "Setup cancelled",
+      );
+      if (captureUiProofEnabled) {
+        await page.screenshot({
+          animations: "disabled",
+          path: path.join(uiProofArtifactDir, "08-cancel-receipt-submitted-desktop.png"),
+        });
+      }
     } finally {
       await suite.closeBrowserContext(context);
     }

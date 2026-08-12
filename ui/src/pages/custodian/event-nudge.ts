@@ -11,7 +11,7 @@ export type CustodianEventNudge = {
 };
 
 export type CustodianSendDelivery = "unsent" | "sent" | "received";
-export type CustodianSendOutcome = "sent" | "rejected" | "unknown";
+export type CustodianSendOutcome = "accepted" | "sent" | "rejected" | "unknown";
 
 export function classifyCustodianSendFailure(
   error: unknown,
@@ -27,7 +27,7 @@ export function classifyCustodianSendFailure(
 }
 
 export function questionUncertainty(previous: boolean, outcome: CustodianSendOutcome): boolean {
-  if (outcome === "sent") {
+  if (outcome === "accepted" || outcome === "sent") {
     return false;
   }
   return outcome === "unknown" ? true : previous;

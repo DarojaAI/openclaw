@@ -123,6 +123,7 @@ describe("system-agent chat input", () => {
         reply: {
           text: "Choose a channel.",
           action: "none",
+          wizardActionAccepted: false,
           step: {
             id: "channel",
             type: "select",
@@ -135,6 +136,7 @@ describe("system-agent chat input", () => {
       sessionId: "s1",
       reply: "Choose a channel.",
       action: "none",
+      wizardActionAccepted: false,
       step: { id: "channel", type: "select" },
     });
   });

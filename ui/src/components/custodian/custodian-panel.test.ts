@@ -61,8 +61,24 @@ describe("custodian panel", () => {
     store.connect(context, "caretaker");
     await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
     store.messages = [
-      { id: 1, role: "assistant", text: "Ready.", at: 1, question: null, step: null },
-      { id: 2, role: "user", text: "Check this system", at: 2, question: null, step: null },
+      {
+        id: 1,
+        role: "assistant",
+        text: "Ready.",
+        at: 1,
+        question: null,
+        step: null,
+        structuredResponse: null,
+      },
+      {
+        id: 2,
+        role: "user",
+        text: "Check this system",
+        at: 2,
+        question: null,
+        step: null,
+        structuredResponse: null,
+      },
     ];
 
     panel.suppressed = false;
@@ -116,7 +132,15 @@ describe("custodian panel", () => {
     store.connect(context, "caretaker");
     await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
     store.messages = [
-      { id: 1, role: "user", text: "Check this system", at: 1, question: null, step: null },
+      {
+        id: 1,
+        role: "user",
+        text: "Check this system",
+        at: 1,
+        question: null,
+        step: null,
+        structuredResponse: null,
+      },
     ];
     panel.available = false;
     panel.suppressed = false;
@@ -141,8 +165,17 @@ describe("custodian panel", () => {
         at: 1,
         question: null,
         step: null,
+        structuredResponse: null,
       },
-      { id: 2, role: "user", text: "Continue setup", at: 2, question: null, step: null },
+      {
+        id: 2,
+        role: "user",
+        text: "Continue setup",
+        at: 2,
+        question: null,
+        step: null,
+        structuredResponse: null,
+      },
     ];
 
     panel.suppressed = false;
