@@ -299,7 +299,8 @@ export function createOpenClawTools(
             });
           });
         };
-  const taskKey = normalizeOptionalString(options?.runSessionKey ?? options?.agentSessionKey);
+  const effectiveSessionKey = options?.runSessionKey ?? options?.agentSessionKey;
+  const taskKey = normalizeOptionalString(effectiveSessionKey);
   const requesterSessionKey = trimmedRunSessionKey || options?.agentSessionKey;
   const requesterTurnRunId = options?.runId;
   const imageTool =
@@ -463,13 +464,13 @@ export function createOpenClawTools(
   });
   const includeAskUserTool = shouldIncludeAskUserToolForOpenClawTools({
     config: resolvedConfig,
-    agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+    agentSessionKey: effectiveSessionKey,
     pluginToolDenylist: options?.pluginToolDenylist,
   });
   const includeTranscriptsTool = resolveTranscriptsConfig(resolvedConfig?.transcripts).enabled;
   const tools: AnyAgentTool[] = [
     createDashboardTool({
-      agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+      agentSessionKey: effectiveSessionKey,
     }),
     ...(embedded
       ? []
@@ -489,7 +490,7 @@ export function createOpenClawTools(
               ]),
           createCronTool({
             // Use the durable runSessionKey; cleanup-retired policy keys leave cron jobs dangling.
-            agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+            agentSessionKey: effectiveSessionKey,
             agentAccountId: gatewayCallerAccountId,
             config: options?.config,
             currentDeliveryContext: {
@@ -506,20 +507,18 @@ export function createOpenClawTools(
             selfRemoveOnlyJobId: options?.cronSelfRemoveOnlyJobId,
           }),
           createSessionsTool({
-            agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+            agentSessionKey: effectiveSessionKey,
             agentSessionId: options?.sessionId,
             sandboxed: options?.sandboxed,
             config: resolvedConfig,
           }),
-          createScreenTool({
-            agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
-          }),
+          createScreenTool({ agentSessionKey: effectiveSessionKey }),
           ...(options?.sandboxed
             ? []
             : [
                 createTerminalTool({
                   agentId: sessionAgentId,
-                  agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+                  agentSessionKey: effectiveSessionKey,
                   runId: options?.runId,
                 }),
                 createPortalTool(),
@@ -540,7 +539,7 @@ export function createOpenClawTools(
           createShowWidgetTool({
             sessionId: options?.sessionId,
             agentId: sessionAgentId,
-            agentSessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+            agentSessionKey: effectiveSessionKey,
           }),
         ]),
     ...collectPresentOpenClawTools([heartbeatTool]),
@@ -589,7 +588,7 @@ export function createOpenClawTools(
             workspaceDir,
             config: resolvedConfig,
             agentId: sessionAgentId,
-            sessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+            sessionKey: effectiveSessionKey,
             runId: options?.runId,
             messageId: options?.currentMessageId,
             run: options?.skillWorkshop,
@@ -601,7 +600,7 @@ export function createOpenClawTools(
       ? [
           createAskUserTool({
             agentId: sessionAgentId,
-            sessionKey: options?.runSessionKey ?? options?.agentSessionKey,
+            sessionKey: effectiveSessionKey,
             runId: options?.runId,
           }),
         ]
