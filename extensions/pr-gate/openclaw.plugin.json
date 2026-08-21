@@ -1,0 +1,25 @@
+{
+  "id": "daroja-pr-gate",
+  "name": "DarojaAI PR-Closeout Gate",
+  "version": "2026.8.1",
+  "description": "Implements RFC DarojaAI/.github#33 pre-send gate: rejects outbound message(send) green-claim phrases when gh pr checks has not been observed for the referenced PR.",
+  "author": "Milan Patel (no_decaf_milan)",
+  "license": "Apache-2.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "greenClaimPhrases": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Phrases that trigger the gate when no fresh gh pr checks observation exists."
+      },
+      "prReferencePattern": {
+        "type": "string",
+        "description": "Regex source used to extract PR numbers from outbound message content."
+      },
+      "ghBinary": { "type": "string" },
+      "observationTtlMs": { "type": "number" },
+      "verbose": { "type": "boolean" }
+    }
+  }
+}
