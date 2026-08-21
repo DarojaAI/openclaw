@@ -17,7 +17,6 @@ import type {
 import { appendAssistantMessageToSessionTranscript } from "../../config/sessions.js";
 import { getOwnedSessionTranscriptWriterFence } from "../../config/sessions/transcript-write-context.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { gateMessageSending, MessageBlockedError } from "../../hooks/internal-hooks.js";
 import {
   normalizeMessagePresentation,
   renderMessagePresentationFallbackText,
@@ -343,22 +342,6 @@ export async function executeSendAction(params: {
   toolResult?: AgentToolResult<unknown>;
   sendResult?: MessageSendResult;
 }> {
-  // Pre-send gate: handlers can block with allow=false. Default-allow when
-  // no handlers are registered. Throws MessageBlockedError if any handler
-  // returns allow=false; the agent harness surfaces the reason to the model.
-  const gateDecision = await gateMessageSending({
-    to: params.to,
-    content: params.message,
-    channelId: params.ctx.channel ?? "",
-    accountId: params.ctx.accountId ?? undefined,
-    metadata: {
-      sessionKey: params.ctx.sessionKey,
-      toolContext: params.ctx.toolContext,
-    },
-  });
-  if (gateDecision.allow === false) {
-    throw new MessageBlockedError(gateDecision.reason, gateDecision.code);
-  }
   throwIfAborted(params.ctx.abortSignal);
   const defaultPayload: ReplyPayload = params.payload ?? {
     text: params.message,
