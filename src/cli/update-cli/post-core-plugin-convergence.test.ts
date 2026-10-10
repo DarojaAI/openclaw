@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 
 const mocks = vi.hoisted(() => ({
-  listManagedPluginNpmRoots: vi.fn(),
+  listManagedPluginNpmRootsForInstallRecords: vi.fn(),
   maybeRepairStaleManagedNpmBundledPlugins: vi.fn(),
   repairMissingConfiguredPluginInstalls: vi.fn(),
   relinkOpenClawPeerDependenciesInManagedNpmRoot: vi.fn(),
@@ -31,7 +31,7 @@ vi.mock("../../plugins/npm-project-roots.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../plugins/npm-project-roots.js")>();
   return {
     ...actual,
-    listManagedPluginNpmRoots: mocks.listManagedPluginNpmRoots,
+    listManagedPluginNpmRootsForInstallRecords: mocks.listManagedPluginNpmRootsForInstallRecords,
   };
 });
 vi.mock("./plugin-payload-validation.js", () => ({
@@ -56,8 +56,8 @@ describe("runPostCorePluginConvergence", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.listManagedPluginNpmRoots.mockImplementation((npmRoot: string) =>
-      Promise.resolve([npmRoot]),
+    mocks.listManagedPluginNpmRootsForInstallRecords.mockImplementation(
+      (params: { npmBaseDir: string }) => [params.npmBaseDir],
     );
     mocks.maybeRepairStaleManagedNpmBundledPlugins.mockReturnValue(false);
     mocks.repairMissingConfiguredPluginInstalls.mockResolvedValue({
@@ -231,7 +231,7 @@ describe("runPostCorePluginConvergence", () => {
       warnings: [],
       records: { codex: { source: "npm", installPath: "/p/codex" } },
     });
-    mocks.listManagedPluginNpmRoots.mockResolvedValue([
+    mocks.listManagedPluginNpmRootsForInstallRecords.mockReturnValue([
       "/tmp/openclaw-state/npm",
       "/tmp/openclaw-state/npm/projects/codex",
     ]);

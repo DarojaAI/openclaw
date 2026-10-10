@@ -2,7 +2,9 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { isNotFoundPathError } from "../infra/path-guards.js";
+import type { PluginInstallRecord } from "../config/types.plugins.js";
+import { isNotFoundPathError, isPathInside } from "../infra/path-guards.js";
+import { resolveUserPath } from "../utils.js";
 import { resolvePluginNpmProjectsDir } from "./install-paths.js";
 
 function isMissing(error: unknown): boolean {
@@ -56,4 +58,36 @@ export function listManagedPluginNpmRootsSync(npmRoot: string): string[] {
 /** Async variant of managed npm root discovery. */
 export async function listManagedPluginNpmRoots(npmRoot: string): Promise<string[]> {
   return [npmRoot, ...(await listManagedPluginNpmProjectRoots(npmRoot))];
+}
+
+/**
+ * Resolves the managed npm roots that own the plugins' own package
+ * directories (the install paths recorded in the install ledger).
+ *
+ * The full managed npm root set includes every accumulated artifact-generation
+ * project tree (`{package}__openclaw-generation__g-<hash>`), each of which is a
+ * separate built npm tree with its own `node_modules`. Walking every one of
+ * those trees is O(all bytes under the npm root) — the deploy-blocking cost
+ * reported in #143. Scoping to only the roots that contain a recorded install
+ * path keeps verification O(active plugins) while still covering every plugin
+ * the ledger says is installed.
+ */
+export function listManagedPluginNpmRootsForInstallRecords(params: {
+  npmBaseDir: string;
+  installRecords: Record<string, PluginInstallRecord>;
+  env?: NodeJS.ProcessEnv;
+}): string[] {
+  const allRoots = listManagedPluginNpmRootsSync(params.npmBaseDir);
+  const installPaths = new Set(
+    Object.values(params.installRecords)
+      .map((record) => record.installPath?.trim())
+      .filter((installPath): installPath is string => Boolean(installPath))
+      .map((installPath) => path.resolve(resolveUserPath(installPath, params.env))),
+  );
+  if (installPaths.size === 0) {
+    return allRoots;
+  }
+  return allRoots.filter((root) =>
+    [...installPaths].some((installPath) => isPathInside(root, installPath)),
+  );
 }

@@ -6,6 +6,7 @@ import { resolvePluginNpmProjectsDir } from "./install-paths.js";
 import {
   listManagedPluginNpmProjectRootsSync,
   listManagedPluginNpmRoots,
+  listManagedPluginNpmRootsForInstallRecords,
 } from "./npm-project-roots.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -58,5 +59,85 @@ describe("managed npm project roots", () => {
 
     vi.spyOn(fs.promises, "readdir").mockRejectedValueOnce(error);
     await expect(listManagedPluginNpmRoots("/fake/npm")).rejects.toThrow(error);
+  });
+});
+
+describe("listManagedPluginNpmRootsForInstallRecords", () => {
+  it("scopes to the roots that own the plugins' own package directories", () => {
+    const npmRoot = makeNpmRoot();
+    const projectsDir = resolvePluginNpmProjectsDir(npmRoot);
+    const activeGeneration = path.join(projectsDir, "codex__openclaw-generation__g-active");
+    const staleGeneration = path.join(projectsDir, "codex__openclaw-generation__g-stale");
+    fs.mkdirSync(activeGeneration, { recursive: true });
+    fs.mkdirSync(staleGeneration, { recursive: true });
+
+    const roots = listManagedPluginNpmRootsForInstallRecords({
+      npmBaseDir: npmRoot,
+      installRecords: {
+        codex: {
+          source: "npm",
+          installPath: path.join(activeGeneration, "node_modules", "@openclaw", "codex"),
+        },
+      },
+      env: {},
+    });
+
+    expect(roots).toEqual([npmRoot, activeGeneration]);
+    expect(roots).not.toContain(staleGeneration);
+  });
+
+  it("keeps the base npm root when an install path lives directly under it", () => {
+    const npmRoot = makeNpmRoot();
+    fs.mkdirSync(path.join(npmRoot, "node_modules"), { recursive: true });
+
+    const roots = listManagedPluginNpmRootsForInstallRecords({
+      npmBaseDir: npmRoot,
+      installRecords: {
+        discord: {
+          source: "npm",
+          installPath: path.join(npmRoot, "node_modules", "@openclaw", "discord"),
+        },
+      },
+      env: {},
+    });
+
+    expect(roots).toEqual([npmRoot]);
+  });
+
+  it("returns the full root set when no install records reference a path", () => {
+    const npmRoot = makeNpmRoot();
+    const projectsDir = resolvePluginNpmProjectsDir(npmRoot);
+    const generation = path.join(projectsDir, "codex__openclaw-generation__g-active");
+    fs.mkdirSync(generation, { recursive: true });
+
+    const roots = listManagedPluginNpmRootsForInstallRecords({
+      npmBaseDir: npmRoot,
+      installRecords: {},
+      env: {},
+    });
+
+    expect(roots).toEqual([npmRoot, generation]);
+  });
+
+  it("excludes generation trees that no install record references", () => {
+    const npmRoot = makeNpmRoot();
+    const projectsDir = resolvePluginNpmProjectsDir(npmRoot);
+    const activeGeneration = path.join(projectsDir, "codex__openclaw-generation__g-active");
+    const staleGeneration = path.join(projectsDir, "codex__openclaw-generation__g-stale");
+    fs.mkdirSync(activeGeneration, { recursive: true });
+    fs.mkdirSync(staleGeneration, { recursive: true });
+
+    const roots = listManagedPluginNpmRootsForInstallRecords({
+      npmBaseDir: npmRoot,
+      installRecords: {
+        codex: {
+          source: "npm",
+          installPath: path.join(activeGeneration, "node_modules", "@openclaw", "codex"),
+        },
+      },
+      env: {},
+    });
+
+    expect(roots).not.toContain(staleGeneration);
   });
 });

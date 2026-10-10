@@ -10,7 +10,10 @@ import {
   loadInstalledPluginIndexInstallRecords,
   type InstalledPluginIndexRecordStoreOptions,
 } from "../plugins/installed-plugin-index-records.js";
-import { listManagedPluginNpmRootsSync } from "../plugins/npm-project-roots.js";
+import {
+  listManagedPluginNpmRootsForInstallRecords,
+  listManagedPluginNpmRootsSync,
+} from "../plugins/npm-project-roots.js";
 import {
   auditOpenClawPeerDependenciesInManagedNpmRoot,
   type OpenClawPeerLinkAuditIssue,
@@ -54,6 +57,27 @@ export function resolveDoctorPluginNpmRoots(
   return listManagedPluginNpmRootsSync(npmRoot);
 }
 
+/**
+ * Resolves the managed npm roots that own the plugins' own package
+ * directories (per the install ledger), excluding accumulated artifact
+ * generation trees that no install record references. Keeps the doctor
+ * peer-link audit O(active plugins) instead of O(all bytes under the npm
+ * root) — the deploy-blocking scan cost reported in #143.
+ */
+export async function resolveScopedDoctorPluginNpmRoots(
+  params: InstalledPluginIndexRecordStoreOptions,
+): Promise<string[]> {
+  const npmRoot = params.stateDir
+    ? path.join(params.stateDir, "npm")
+    : resolveDefaultPluginNpmDir(params.env);
+  const installRecords = await loadInstalledPluginIndexInstallRecords(params);
+  return listManagedPluginNpmRootsForInstallRecords({
+    npmBaseDir: npmRoot,
+    installRecords,
+    env: params.env,
+  });
+}
+
 /** Audits managed and registered npm plugin host links without mutating either root. */
 export async function listPluginOpenClawHostLinkIssues(
   params: InstalledPluginIndexRecordStoreOptions,
@@ -61,7 +85,7 @@ export async function listPluginOpenClawHostLinkIssues(
   const packageReadFailures: PluginPackageReadFailure[] = [];
   const registeredPackageReadFailures: PluginPackageReadFailure[] = [];
   const audits = await Promise.all(
-    resolveDoctorPluginNpmRoots(params).map((npmRoot) =>
+    (await resolveScopedDoctorPluginNpmRoots(params)).map((npmRoot) =>
       auditOpenClawPeerDependenciesInManagedNpmRoot({
         npmRoot,
         onPackageReadError: (error, packageDir) => {
@@ -97,7 +121,7 @@ export async function listPluginOpenClawHostLinkIssues(
 export async function maybeRepairPluginOpenClawHostLinks(
   params: PluginHostLinkDoctorParams,
 ): Promise<boolean> {
-  const npmRoots = resolveDoctorPluginNpmRoots(params);
+  const npmRoots = await resolveScopedDoctorPluginNpmRoots(params);
   if (!params.prompter.shouldRepair) {
     const audit = await listPluginOpenClawHostLinkIssues(params);
     if (audit.peerLinkIssues.length > 0) {
