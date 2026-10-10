@@ -107,6 +107,8 @@ describe("Skill Workshop history scan", () => {
     expect(prompt).not.toContain("+14155550123");
     expect(prompt).not.toContain("credential-like-private-instance");
     expect(prompt).toContain("NOTHING_TO_LEARN");
+    expect(prompt).toContain("check ~/.openclaw/skills/ for an existing applied skill");
+    expect(prompt).toContain("already-applied: <skill>");
 
     const checkpointedPrompt = buildSkillHistoryScanPrompt({
       requireCompletion: true,

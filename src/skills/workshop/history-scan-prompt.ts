@@ -41,6 +41,8 @@ export function buildSkillHistoryScanPrompt(params: {
     "",
     `Use list/inspect before mutation. An interrupted pass may already have durable proposals, so do not duplicate them. Cluster overlapping evidence into one useful proposal. Prefer revising a relevant pending proposal. Otherwise create a new proposal. Make at most three create/revise calls. Never apply, reject, quarantine, or modify a live skill. Cite only the supporting session number and activity date in proposal evidence. If nothing clears the bar, make no mutation and answer NOTHING_TO_LEARN.${params.requireCompletion ? " After all proposal work, call skill_workshop with action=complete as your final tool call; this is required even when nothing is learned." : ""}`,
     "",
+    "Before proposing a new skill, check ~/.openclaw/skills/ for an existing applied skill that already covers the same behavior. If such an applied skill exists, do NOT create or revise a proposal for it; instead report 'already-applied: <skill>' using the applied skill's directory name and make no mutation for that idea. A proposal that would only re-propose an already-applied skill is out of scope for this pass.",
+    "",
     `Sessions reviewed: ${params.sessions.length}`,
     "",
     evidence,

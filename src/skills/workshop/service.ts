@@ -1,4 +1,6 @@
+import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { resolveStateDir } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { sha256Hex } from "../../infra/crypto-digest.js";
 import { buildWorkspaceSkillStatus, resolveSkillStatusEntry } from "../discovery/status.js";
@@ -129,6 +131,30 @@ function mergeProposalOriginRunProvenance(
   };
 }
 
+/**
+ * Returns the applied skill key whose SKILL.md already exists in the installed
+ * skills directory (~/.openclaw/skills/<key>/SKILL.md), or null. Reviewers may
+ * name a re-proposal "applied-<skill>" for a live skill "<skill>", so the key
+ * with a leading "applied-" prefix stripped is checked as well.
+ */
+async function findExistingAppliedSkill(params: {
+  skillKey: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<string | null> {
+  const appliedSkillsRoot = path.join(resolveStateDir(params.env), "skills");
+  const candidateKeys = [params.skillKey];
+  const stripped = params.skillKey.replace(/^applied-/, "");
+  if (stripped && stripped !== params.skillKey) {
+    candidateKeys.push(stripped);
+  }
+  for (const key of candidateKeys) {
+    if ((await readWorkspaceSkillFile(path.join(appliedSkillsRoot, key, "SKILL.md"))) !== null) {
+      return key;
+    }
+  }
+  return null;
+}
+
 export async function proposeCreateSkill(
   input: SkillProposalCreateInput,
 ): Promise<SkillProposalReadResult> {
@@ -138,6 +164,16 @@ export async function proposeCreateSkill(
   const target = resolveSkillProposalTarget({ workspaceDir: input.workspaceDir, skillName: name });
   if ((await readWorkspaceSkillFile(target.skillFile)) !== null) {
     throw new Error(`Skill already exists at ${target.skillFile}.`);
+  }
+  const existingAppliedSkill = await findExistingAppliedSkill({
+    skillKey: target.skillKey,
+    env: input.env,
+  });
+  if (existingAppliedSkill) {
+    throw new Error(
+      `Skill already applied as ${existingAppliedSkill} in ~/.openclaw/skills/${existingAppliedSkill}. ` +
+        `Report 'already-applied: ${existingAppliedSkill}' instead of creating a proposal.`,
+    );
   }
 
   const now = new Date().toISOString();

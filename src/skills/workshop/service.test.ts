@@ -460,6 +460,44 @@ describe("skill workshop proposals", () => {
     ).rejects.toThrow("Skill already exists");
   });
 
+  it("rejects create proposals whose applied skill already exists", async () => {
+    const workspaceDir = await makeWorkspace();
+    const appliedSkillsDir = path.join(stateDir, "skills", "already-applied-skill");
+    await fs.mkdir(appliedSkillsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(appliedSkillsDir, "SKILL.md"),
+      "# Already Applied\n\nExisting applied skill.\n",
+      "utf8",
+    );
+
+    await expect(
+      proposeCreateSkill({
+        workspaceDir,
+        env: testState.env,
+        name: "Already Applied Skill",
+        description: "Re-proposes an existing applied skill",
+        content: "# Already Applied Skill\n",
+      }),
+    ).rejects.toThrow("already-applied: already-applied-skill");
+  });
+
+  it("rejects create proposals whose applied form exists under a stripped applied- name", async () => {
+    const workspaceDir = await makeWorkspace();
+    const appliedSkillsDir = path.join(stateDir, "skills", "existing-skill");
+    await fs.mkdir(appliedSkillsDir, { recursive: true });
+    await fs.writeFile(path.join(appliedSkillsDir, "SKILL.md"), "# Existing\n", "utf8");
+
+    await expect(
+      proposeCreateSkill({
+        workspaceDir,
+        env: testState.env,
+        name: "applied-existing-skill",
+        description: "Reviewer-named re-proposal of a live skill",
+        content: "# applied-existing-skill\n",
+      }),
+    ).rejects.toThrow("already-applied: existing-skill");
+  });
+
   it("reconciles pending create proposals when their target skills are created manually", async () => {
     const workspaceDir = await makeWorkspace();
     const listed = await proposeCreateSkill({
