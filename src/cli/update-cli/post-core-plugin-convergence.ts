@@ -9,7 +9,7 @@ import {
   resolveDefaultPluginExtensionsDir,
   resolveDefaultPluginNpmDir,
 } from "../../plugins/install-paths.js";
-import { listManagedPluginNpmRoots } from "../../plugins/npm-project-roots.js";
+import { listManagedPluginNpmRootsForInstallRecords } from "../../plugins/npm-project-roots.js";
 import {
   reconcileRegisteredOpenClawHostLinks,
   relinkOpenClawPeerDependenciesInManagedNpmRoot,
@@ -76,7 +76,11 @@ async function repairInstalledNpmOpenClawHostLinks(params: {
 }> {
   const packageReadFailures: Array<{ error: unknown; packageDir: string }> = [];
   try {
-    const npmRoots = await listManagedPluginNpmRoots(resolveDefaultPluginNpmDir(params.env));
+    const npmRoots = await listManagedPluginNpmRootsForInstallRecords({
+      npmBaseDir: resolveDefaultPluginNpmDir(params.env),
+      installRecords: params.installRecords,
+      env: params.env,
+    });
     const results = await Promise.all(
       npmRoots.map((npmRoot) =>
         relinkOpenClawPeerDependenciesInManagedNpmRoot({
