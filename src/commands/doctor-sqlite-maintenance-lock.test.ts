@@ -43,6 +43,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/** Returns a pid that is not alive (process.kill(pid, 0) throws), i.e. a dead owner. */
+function findDeadPid(): number {
+  // Start well above the Linux pid_max ceiling so the range is guaranteed to
+  // contain only nonexistent pids; the first pid that signals ESRCH is dead.
+  for (let pid = 20_000_000; pid < 20_000_100; pid += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return pid;
+    }
+  }
+  throw new Error("unable to find a dead pid");
+}
+
 describe("doctor SQLite maintenance lock", () => {
   it.each([
     ["inspect", false],
@@ -85,6 +99,47 @@ describe("doctor SQLite maintenance lock", () => {
     } finally {
       await gatewayLock.release();
     }
+  });
+
+  it("reclaims a maintenance lock left by a killed doctor so the next run can proceed (#142)", async () => {
+    const fixture = await createLockFixture();
+    // Simulate a crashed (SIGKILLed) doctor: write a stale sqlite-maintenance
+    // owner with a pid that is no longer alive, exactly as a killed process
+    // leaves behind. The next maintenance run must reclaim it rather than
+    // wedging forever on the dead owner.
+    const deadOwnerPid = findDeadPid();
+    await fs.mkdir(fixture.lockDir, { recursive: true });
+    await fs.writeFile(
+      path.join(fixture.lockDir, "gateway.state.lock"),
+      JSON.stringify({
+        pid: deadOwnerPid,
+        createdAt: new Date().toISOString(),
+        configPath: fixture.env.OPENCLAW_CONFIG_PATH,
+        role: "sqlite-maintenance",
+        startTime: 111,
+      }),
+      "utf8",
+    );
+    const run = vi.fn(async () => "maintained");
+
+    const result = await withDoctorSqliteMaintenanceLock(
+      {
+        env: fixture.env,
+        operation: "state SQLite compaction",
+        run,
+      },
+      { lockOptions: { ...fixture.lockOptions, timeoutMs: 500 } },
+    );
+
+    expect(result).toBe("maintained");
+    expect(run).toHaveBeenCalledTimes(1);
+    // The crashed owner's lock is reclaimed and released on completion, so a
+    // later run does not inherit a forever-stale file.
+    await expect(fs.access(path.join(fixture.lockDir, "gateway.state.lock"))).rejects.toMatchObject(
+      {
+        code: "ENOENT",
+      },
+    );
   });
 
   it("prevents Gateway startup until maintenance releases ownership", async () => {
