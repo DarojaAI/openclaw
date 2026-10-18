@@ -22,6 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import type {
   BeforeRouteInboundMessageTurnOptions,
   PreflightDecisionEvent,
@@ -117,6 +118,7 @@ function defaultSpawn(python: string): PreflightGateSpawn {
         typeof error.code === "number"
           ? error.code
           : 1;
+      const message = toStringifiedError(error).message;
       const stdout =
         typeof error === "object" && error !== null && "stdout" in error
           ? typeof error.stdout === "string"
@@ -127,8 +129,8 @@ function defaultSpawn(python: string): PreflightGateSpawn {
         typeof error === "object" && error !== null && "stderr" in error
           ? typeof error.stderr === "string"
             ? error.stderr
-            : String(error)
-          : String(error);
+            : message
+          : message;
       return { exitCode: code, stdout, stderr };
     }
   };
