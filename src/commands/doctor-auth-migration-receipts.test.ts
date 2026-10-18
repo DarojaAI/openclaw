@@ -14,6 +14,7 @@ import {
   archiveAuthProfileMigrationSource,
   createAuthProfileMigrationSourceReceipt,
   digestAuthProfileMigrationValue,
+  findTerminalAuthProfileMigrationReceipt,
   resumePendingAuthProfileMigrationArchives,
 } from "./doctor-auth-migration-receipts.js";
 
@@ -68,6 +69,23 @@ describe("auth profile migration receipts", () => {
     });
     return { state, sourcePath, receipt };
   }
+
+  it("returns the recorded terminal archive path only after completion", async () => {
+    const { state, sourcePath, receipt } = await makeReceipt();
+
+    expect(findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, state.env)).toBeNull();
+
+    recordAuthProfileMigrationImported(receipt);
+    expect(findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, state.env)).toBeNull();
+
+    archiveAuthProfileMigrationSource(receipt);
+    recordAuthProfileMigrationCompleted(receipt);
+    expect(fs.existsSync(sourcePath)).toBe(false);
+
+    expect(findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, state.env)).toEqual({
+      archivePath: receipt.archivePath,
+    });
+  });
 
   it("resumes after target commit and receipt but before archive", async () => {
     const { state, sourcePath, receipt } = await makeReceipt();

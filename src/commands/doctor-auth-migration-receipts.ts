@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { isStringRecord as isRecordOfStrings } from "@openclaw/normalization-core/record-coerce";
+import {
+  isRecord,
+  isStringRecord as isRecordOfStrings,
+} from "@openclaw/normalization-core/record-coerce";
 import { acquireFileLockSyncWithRetry } from "../infra/file-lock-sync.js";
 import {
   executeSqliteQuerySync,
@@ -430,19 +433,25 @@ export function resumePendingAuthProfileMigrationArchives(env?: NodeJS.ProcessEn
   return changes;
 }
 
-export function hasTerminalAuthProfileMigrationReceipt(
+export function findTerminalAuthProfileMigrationReceipt(
   sourceKey: string,
   env?: NodeJS.ProcessEnv,
-): boolean {
+): { archivePath: string } | null {
   const database = openOpenClawStateDatabase({ env });
   const row = executeSqliteQueryTakeFirstSync(
     database.db,
     getNodeSqliteKysely<MigrationDatabase>(database.db)
       .selectFrom("migration_sources")
-      .select("status")
+      .select(["status", "report_json"])
       .where("source_key", "=", sourceKey),
   );
-  return row?.status === "completed" || row?.status === "archived-unparsed";
+  if (row?.status !== "completed" && row?.status !== "archived-unparsed") {
+    return null;
+  }
+  const report = typeof row.report_json === "string" ? JSON.parse(row.report_json) : null;
+  return isRecord(report) && typeof report.archivePath === "string"
+    ? { archivePath: report.archivePath }
+    : null;
 }
 
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
