@@ -63,7 +63,7 @@ import {
   createAuthProfileMigrationSourceReceipt,
   digestAuthProfileMigrationValue,
   finalizeAuthProfileMigrationSource,
-  hasTerminalAuthProfileMigrationReceipt,
+  findTerminalAuthProfileMigrationReceipt,
   resumePendingAuthProfileMigrationArchives,
   type AuthProfileMigrationSourceReceipt,
 } from "./doctor-auth-migration-receipts.js";
@@ -792,8 +792,25 @@ function archivePreviouslyMigratedAuthProfileSource(
   receipt: AuthProfileMigrationSourceReceipt,
   result: LegacyFlatAuthProfileRepairResult,
 ): boolean {
-  if (!hasTerminalAuthProfileMigrationReceipt(receipt.sourceKey, receipt.env)) {
+  const terminal = findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, receipt.env);
+  if (!terminal) {
     return false;
+  }
+  // The exact source bytes already ended in a terminal archive; a reappeared
+  // identical copy must not mint another timestamped snapshot on every pass.
+  // Remove it only when its legacy archive still preserves the verified bytes.
+  if (fs.existsSync(terminal.archivePath)) {
+    const currentSha256 = createHash("sha256")
+      .update(fs.readFileSync(receipt.sourcePath))
+      .digest("hex");
+    if (currentSha256 !== receipt.sourceSha256) {
+      throw new Error("legacy auth source changed after verification");
+    }
+    fs.rmSync(receipt.sourcePath);
+    result.changes.push(
+      `Removed a reappeared already-migrated legacy auth source without a new snapshot (bytes already archived at ${shortenHomePath(terminal.archivePath)}).`,
+    );
+    return true;
   }
   archiveAuthProfileMigrationSource(receipt);
   result.changes.push(

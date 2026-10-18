@@ -351,7 +351,7 @@ describe("maybeMigrateAuthProfileJsonStoresToSqlite", () => {
     expect(loadPersistedAuthProfileStore(state.agentDir())).toBeNull();
   });
 
-  it("archives restored OAuth bytes without replaying a terminal receipt", async () => {
+  it("cleans up restored OAuth bytes without re-archiving a terminal receipt", async () => {
     const state = await makeTestState();
     const oauthPath = await state.writeJson("credentials/oauth.json", {
       openai: {
@@ -378,10 +378,121 @@ describe("maybeMigrateAuthProfileJsonStoresToSqlite", () => {
       env: state.env,
     });
 
-    expect(replay.changes).toEqual([expect.stringContaining("without replaying credentials")]);
+    expect(replay.changes).toEqual([expect.stringContaining("without a new snapshot")]);
     expect(loadPersistedAuthProfileStore(state.agentDir())?.profiles).toEqual({});
     expect(fs.existsSync(oauthPath)).toBe(false);
-    expect(listMigratedArchives(oauthPath)).toHaveLength(2);
+    expect(listMigratedArchives(oauthPath)).toHaveLength(1);
+  });
+
+  it("does not re-snapshot a reappeared already-migrated auth-profiles.json", async () => {
+    const state = await makeTestState();
+    const authPath = await writeLegacyAuthProfilesJson(state, {
+      version: 1,
+      profiles: {
+        "openai:default": { type: "api_key", provider: "openai", key: "not-a-real" },
+      },
+    });
+    const sourceBytes = fs.readFileSync(authPath);
+
+    await maybeMigrateAuthProfileJsonStoresToSqlite({
+      cfg: {},
+      prompter: makePrompter(true),
+      env: state.env,
+    });
+    fs.writeFileSync(authPath, sourceBytes);
+
+    const replay = await maybeMigrateAuthProfileJsonStoresToSqlite({
+      cfg: {},
+      prompter: makePrompter(true),
+      env: state.env,
+    });
+
+    expect(replay.changes).toEqual([expect.stringContaining("without a new snapshot")]);
+    expect(
+      loadPersistedAuthProfileStore(state.agentDir())?.profiles["openai:default"],
+    ).toMatchObject({ type: "api_key", provider: "openai" });
+    expect(fs.existsSync(authPath)).toBe(false);
+    expect(listMigratedArchives(authPath)).toHaveLength(1);
+  });
+
+  it("snapshots an already-migrated auth source again when its bytes changed", async () => {
+    const state = await makeTestState();
+    const authPath = await writeLegacyAuthProfilesJson(state, {
+      version: 1,
+      profiles: {
+        "openai:default": { type: "api_key", provider: "openai", key: "first-key" },
+      },
+    });
+    await maybeMigrateAuthProfileJsonStoresToSqlite({
+      cfg: {},
+      prompter: makePrompter(true),
+      env: state.env,
+    });
+    const mutated = `${JSON.stringify(
+      {
+        version: 1,
+        profiles: {
+          "openai:default": { type: "api_key", provider: "openai", key: "first-key" },
+          "anthropic:default": { type: "api_key", provider: "anthropic", key: "claude-key" },
+        },
+      },
+      null,
+      2,
+    )}\n`;
+    fs.writeFileSync(authPath, mutated, "utf8");
+
+    const replay = await maybeMigrateAuthProfileJsonStoresToSqlite({
+      cfg: {},
+      prompter: makePrompter(true),
+      env: state.env,
+    });
+
+    // Mutated bytes have no terminal receipt, so Doctor snapshots them again
+    // and imports the newly added profile without clobbering existing ones.
+    expect(replay.changes).toEqual([expect.stringContaining("Migrated auth profile JSON for")]);
+    expect(loadPersistedAuthProfileStore(state.agentDir())?.profiles).toMatchObject({
+      "openai:default": { key: "first-key" },
+      "anthropic:default": { key: "claude-key" },
+    });
+    expect(fs.existsSync(authPath)).toBe(false);
+    const archives = listMigratedArchives(authPath);
+    expect(archives).toHaveLength(2);
+    expect(
+      archives.some((archive) => fs.readFileSync(archive).equals(Buffer.from(mutated, "utf8"))),
+    ).toBe(true);
+  });
+
+  it("re-archives an already-migrated auth source when its terminal archive is missing", async () => {
+    const state = await makeTestState();
+    const authPath = await writeLegacyAuthProfilesJson(state, {
+      version: 1,
+      profiles: {
+        "openai:default": { type: "api_key", provider: "openai", key: "not-a-real" },
+      },
+    });
+    const sourceBytes = fs.readFileSync(authPath);
+
+    await maybeMigrateAuthProfileJsonStoresToSqlite({
+      cfg: {},
+      prompter: makePrompter(true),
+      env: state.env,
+    });
+    const [archive] = listMigratedArchives(authPath);
+    fs.rmSync(archive!);
+    fs.writeFileSync(authPath, sourceBytes);
+
+    const replay = await maybeMigrateAuthProfileJsonStoresToSqlite({
+      cfg: {},
+      prompter: makePrompter(true),
+      env: state.env,
+    });
+
+    expect(replay.changes).toEqual([
+      expect.stringContaining("Archived a previously migrated legacy auth source"),
+    ]);
+    expect(fs.existsSync(authPath)).toBe(false);
+    expect(listMigratedArchives(authPath)).toHaveLength(1);
+    expect(fs.readFileSync(listMigratedArchives(authPath)[0]!)).toEqual(sourceBytes);
   });
 
   it("marks a partially parsed shared OAuth source for manual recovery", async () => {
