@@ -16,6 +16,8 @@ export type SessionTranscriptReconcileParams = OpenClawAgentDatabaseOptions & {
   preferredSessionId?: string;
   assertCurrent?: () => void;
   signal?: AbortSignal;
+  /** Worker settlement budget; a hung worker is retired and the run fails. */
+  timeoutMs?: number;
 };
 
 export type PreparedReconcileParams = SessionTranscriptReconcileParams & {

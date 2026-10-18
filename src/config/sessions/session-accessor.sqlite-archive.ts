@@ -46,8 +46,11 @@ import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-ru
 export function createSqliteTranscriptArchiveWorker(
   workerData: object,
   nativeLocations: readonly string[] = [],
+  workerUrlOverride?: URL,
 ): Worker {
-  const workerUrl = resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.sessionTranscriptArchive);
+  const workerUrl =
+    workerUrlOverride ??
+    resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.sessionTranscriptArchive);
   let active = true;
   const admission = createSqliteDatabaseAdmissionRelay(() => {
     if (!active) {
@@ -86,6 +89,10 @@ export function createSqliteTranscriptArchiveWorker(
 type TranscriptArchiveWorkerOperation<Result> = {
   assertCurrent?: () => void;
   signal?: AbortSignal;
+  /** Worker settlement budget; a hung one-shot worker is terminated and the call fails. */
+  timeoutMs?: number;
+  /** Test override: spawn the archive worker from this URL instead of the entrypoint. */
+  workerUrl?: URL;
 } & (
   | { expectedMessageType: "done" | "published" | "sized"; workerData: object }
   | {
@@ -117,6 +124,7 @@ function spawnSqliteTranscriptArchiveWorkerOperation<Result>(
       params.expectedMessageType === "reclaimed"
         ? [params.workerData.plan.databaseOptions.path, params.stateContext.admission.databasePath]
         : [],
+      params.workerUrl,
     );
   } catch (error) {
     return Promise.reject(toStringifiedError(error));
@@ -185,36 +193,71 @@ function spawnSqliteTranscriptArchiveWorkerOperation<Result>(
     return operation;
   }
 
-  return new Promise((resolve, reject) => {
-    let results: Result[] | undefined;
-    let workerError: Error | undefined;
-    worker.on("message", (message: { results: Result[]; type: string }) => {
-      if (message.type === params.expectedMessageType) {
-        (results ??= []).push(...message.results);
-      }
-    });
-    worker.once("error", (error) => {
-      // An uncaught Worker error is followed by exit. Wait for that event so
-      // callers never race the Worker's SQLite/file handles on Windows.
-      workerError ??= toStringifiedError(error);
-    });
-    worker.once("exit", (code) => {
-      worker.removeAllListeners();
-      if (workerError) {
-        reject(workerError);
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`SQLite transcript archive worker exited with code ${code}`));
-        return;
-      }
-      if (!results) {
-        reject(new Error("SQLite transcript archive worker exited without results"));
-        return;
-      }
-      resolve(results);
-    });
+  const { promise, resolve, reject } = Promise.withResolvers<Result[]>();
+  let results: Result[] | undefined;
+  let workerError: Error | undefined;
+  let settled = false;
+  let timer: NodeJS.Timeout | undefined;
+  // A one-shot archive worker stuck in native SQLite/fsync never answers the
+  // heap sampler nor emits message/exit, so every later archive plan queues
+  // behind it forever. When a timeout budget is set, terminate the hung
+  // isolate and settle deterministically so the queue slot frees.
+  const settle = (finish: () => void, terminate: boolean) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timer);
+    worker.removeAllListeners();
+    if (terminate) {
+      void worker.terminate().catch(() => undefined);
+    }
+    finish();
+  };
+  if (params.timeoutMs !== undefined) {
+    timer = setTimeout(() => {
+      settle(
+        () =>
+          reject(
+            new Error(`SQLite transcript archive worker timed out after ${params.timeoutMs}ms`),
+          ),
+        true,
+      );
+    }, params.timeoutMs);
+    timer.unref?.();
+  }
+  worker.on("message", (message: { results: Result[]; type: string }) => {
+    if (message.type === params.expectedMessageType) {
+      (results ??= []).push(...message.results);
+    }
   });
+  worker.once("error", (error) => {
+    // An uncaught Worker error is followed by exit. Wait for that event so
+    // callers never race the Worker's SQLite/file handles on Windows.
+    workerError ??= toStringifiedError(error);
+  });
+  worker.once("exit", (code) => {
+    if (workerError) {
+      settle(() => reject(workerError as Error), false);
+      return;
+    }
+    if (code !== 0) {
+      settle(
+        () => reject(new Error(`SQLite transcript archive worker exited with code ${code}`)),
+        false,
+      );
+      return;
+    }
+    if (!results) {
+      settle(
+        () => reject(new Error("SQLite transcript archive worker exited without results")),
+        false,
+      );
+      return;
+    }
+    settle(() => resolve(results), false);
+  });
+  return promise;
 }
 
 // Serialize lifecycle archive Workers so this path cannot multiply
@@ -224,6 +267,13 @@ const sqliteTranscriptArchiveWorkerQueue = resolveGlobalSingleton(
   () => new KeyedAsyncQueue(),
 );
 const SQLITE_TRANSCRIPT_ARCHIVE_WORKER_QUEUE_KEY = "lifecycle-archive";
+// Upper bound on archive plans admitted but not yet settled. Every pending
+// entry keeps its worker isolate and transcript snapshot alive outside the
+// host V8 heap; a wedged worker must bound admissions instead of accumulating
+// whole-buffer usage off the heap (the #176080 worker-wedge path).
+export const SQLITE_ARCHIVE_QUEUE_MAX_PLANS = 64;
+export const SQLITE_ARCHIVE_WORKER_TIMEOUT_MS = 120_000;
+let sqliteTranscriptArchiveQueuePlans = 0;
 
 export function runExclusiveSqliteTranscriptArchiveWorker<T>(
   run: () => Promise<T>,
@@ -271,24 +321,45 @@ export function runSqliteTranscriptArchiveWorkerOperation<Result>(
   }, params.signal);
 }
 
+type SqliteArchiveWorkerOptions = {
+  queueMaxPlans?: number;
+  timeoutMs?: number;
+  workerUrl?: URL;
+};
+
 function runSqliteTranscriptArchiveWorker(
   plans: readonly TranscriptArchiveWorkerPlan[],
+  options: SqliteArchiveWorkerOptions = {},
 ): Promise<TranscriptArchiveWorkerResult[]> {
+  const queueMaxPlans = options.queueMaxPlans ?? SQLITE_ARCHIVE_QUEUE_MAX_PLANS;
+  if (sqliteTranscriptArchiveQueuePlans + plans.length > queueMaxPlans) {
+    return Promise.reject(
+      new Error(`SQLite transcript archive queue is full (${queueMaxPlans} plans)`),
+    );
+  }
+  sqliteTranscriptArchiveQueuePlans += plans.length;
   const scoped = runScopedSqliteArchiveOperation(
     { operation: "materialize", plans },
     createSqliteTranscriptArchiveWorker,
     runExclusiveSqliteTranscriptArchiveWorker,
   );
-  if (scoped) {
-    return scoped.then((result) => result.results);
-  }
-  return runSqliteTranscriptArchiveWorkerOperation<TranscriptArchiveWorkerResult>({
-    expectedMessageType: "done",
-    workerData: {
-      operation: "materialize",
-      type: "sqlite-transcript-archive-v2",
-      plans,
-    } satisfies SqliteArchiveOneShotWorkerData,
+  const run = scoped
+    ? scoped.then((result) => result.results)
+    : runSqliteTranscriptArchiveWorkerOperation<TranscriptArchiveWorkerResult>({
+        expectedMessageType: "done",
+        timeoutMs: options.timeoutMs ?? SQLITE_ARCHIVE_WORKER_TIMEOUT_MS,
+        ...(options.workerUrl ? { workerUrl: options.workerUrl } : {}),
+        workerData: {
+          operation: "materialize",
+          type: "sqlite-transcript-archive-v2",
+          plans,
+        } satisfies SqliteArchiveOneShotWorkerData,
+      });
+  return run.finally(() => {
+    sqliteTranscriptArchiveQueuePlans = Math.max(
+      0,
+      sqliteTranscriptArchiveQueuePlans - plans.length,
+    );
   });
 }
 
@@ -366,6 +437,11 @@ export async function runSqliteTranscriptArchivePageWorker(
 // dedupe prevent concurrent whole-buffer spikes within this path.
 export async function materializeSessionStateDeletePlans(
   plans: readonly SessionStateDeletePlan[],
+  options: {
+    archiveWorkerTimeoutMs?: number;
+    archiveQueueMaxPlans?: number;
+    archiveWorkerUrl?: URL;
+  } = {},
 ): Promise<MaterializedSessionStateDeletePlan[]> {
   const deduped = dedupeSqliteSessionStateDeletePlans(plans);
   // Empty snapshots have no archive bytes; the deletion transaction still rejects later appends.
@@ -373,7 +449,13 @@ export async function materializeSessionStateDeletePlans(
     (plan) => plan.archiveTranscript && plan.snapshot.lastSeq !== null,
   );
   const workerResults =
-    workerPlans.length > 0 ? await runSqliteTranscriptArchiveWorker(workerPlans) : [];
+    workerPlans.length > 0
+      ? await runSqliteTranscriptArchiveWorker(workerPlans, {
+          timeoutMs: options.archiveWorkerTimeoutMs,
+          queueMaxPlans: options.archiveQueueMaxPlans,
+          ...(options.archiveWorkerUrl ? { workerUrl: options.archiveWorkerUrl } : {}),
+        })
+      : [];
   const resultBySessionId = new Map(workerResults.map((result) => [result.sessionId, result]));
 
   return deduped.map((plan) => {

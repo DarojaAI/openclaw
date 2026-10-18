@@ -74,6 +74,12 @@ import type {
 const log = createSubsystemLogger("sessions/transcript-index");
 const PROJECTION_READY_POLL_MS = 10;
 const RECONCILE_RETRY_BACKOFF_MS: readonly number[] = [0, 50, 200, 500, 1_000];
+// A reconcile worker stuck in native SQLite (the worker-wedge path behind
+// #176080) never reports done or exits. Gateway startup awaits the reconcile
+// owner, so a wedged worker must settle within a bounded window instead of
+// stalling the owner forever. The timer is unref'd so a healthy owner never
+// pins the process.
+const SESSION_TRANSCRIPT_RECONCILE_TIMEOUT_MS = 5 * 60_000;
 type RunningReconcile = {
   assertCurrent?: () => void;
   pending: boolean;
@@ -258,13 +264,26 @@ async function reconcilePreparedTranscriptIndexesPass(
         let active: ActivePreparedProjection | undefined;
         let reconciledSessions = 0;
         let settled = false;
+        let timer: NodeJS.Timeout | undefined;
         const settle = (finish: () => void) => {
           if (settled) {
             return;
           }
           settled = true;
+          clearTimeout(timer);
           finish();
         };
+        const timeoutMs = params.timeoutMs ?? SESSION_TRANSCRIPT_RECONCILE_TIMEOUT_MS;
+        timer = setTimeout(() => {
+          settle(() => {
+            // A worker stuck in native SQLite never reports done or exits. Retire
+            // the hung isolate and fail this pass so the scheduled reconcile
+            // owner relinquishes and later writes reschedule instead of wedging.
+            task.controller.abort();
+            reject(new Error(`session transcript reconcile worker timed out after ${timeoutMs}ms`));
+          });
+        }, timeoutMs);
+        timer.unref?.();
         const handleMessage = async (
           message: Exclude<
             SessionTranscriptReconcileWorkerMessage,
