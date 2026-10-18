@@ -16,7 +16,7 @@ import {
   resolvePreflightGatePath,
   runBeforeRouteInboundMessage,
 } from "./before-route-inbound-message.js";
-import type { PreflightGateSpawn } from "./before-route-inbound-message.js";
+import type { PreflightGateSpawn } from "./preflight-gate-contract.js";
 import { runChannelTurn } from "./run-channel-turn.js";
 
 const ALLOW_EVENT = JSON.stringify({

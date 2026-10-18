@@ -22,6 +22,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import type {
+  BeforeRouteInboundMessageTurnOptions,
+  PreflightDecisionEvent,
+  PreflightGateClient,
+  PreflightGateDecision,
+  PreflightGateInvocation,
+  PreflightGateOutcome,
+  PreflightGateSpawn,
+} from "./preflight-gate-contract.js";
 import type { ChannelTurnAdmission } from "./types.js";
 
 export const BEFORE_ROUTE_INBOUND_MESSAGE_HOOK = "before_route_inbound_message" as const;
@@ -36,61 +45,6 @@ export const PREFLIGHT_EVENT_LOG_ENV = "PREFLIGHT_EVENT_LOG" as const;
 export const PREFLIGHT_GATE_EXIT_ALLOW = 0 as const;
 export const PREFLIGHT_GATE_EXIT_REJECT = 1 as const;
 export const PREFLIGHT_GATE_EXIT_CONFIG_ERROR = 2 as const;
-
-/** Facts passed to the gate for one inbound message. */
-export type PreflightGateInvocation = {
-  actor?: string;
-  agent?: string;
-  capability?: string;
-  route?: string;
-  tenant?: {
-    counterpartyId?: string;
-    clientId?: string;
-    projectId?: string;
-    jwt?: string;
-    audience?: string;
-  };
-  consentFile?: string;
-  postureFile?: string;
-  principals?: string;
-  eventLog?: string;
-};
-
-/** The `preflight.decision.v1` envelope emitted by the gate (contract §Event). */
-export type PreflightDecisionEvent = {
-  event: "preflight.decision.v1";
-  timestamp: string;
-  agentId?: string;
-  actor?: string;
-  capability?: string;
-  decision: "allow" | "reject";
-  reason: string;
-  principalKnown: boolean;
-  tenant?: string;
-  consent?: string;
-  posture?: string;
-  /** Forward-compatible additive field kept per §7.2 envelopes. */
-  category?: string;
-};
-
-export type PreflightGateDecision = "allow" | "reject" | "config-error";
-
-export type PreflightGateOutcome = {
-  exitCode: number;
-  decision: PreflightGateDecision;
-  event: PreflightDecisionEvent | null;
-  stderr?: string;
-};
-
-/** Spawn contract injected for tests; the real default runs `python3 <gate>`. */
-export type PreflightGateSpawn = (
-  args: readonly string[],
-) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
-
-export interface PreflightGateClient {
-  readonly configured: boolean;
-  invoke(invocation: PreflightGateInvocation): Promise<PreflightGateOutcome>;
-}
 
 function isPreflightDecisionEvent(value: unknown): value is PreflightDecisionEvent {
   if (typeof value !== "object" || value === null) {
@@ -242,6 +196,8 @@ export function createPreflightGateClient(options?: {
         };
       }
       const scriptArgs = buildPreflightGateEvaluateArgs(invocation);
+      // `configured` is true only when gatePath is a non-null existing path.
+      // SAFETY: this branch is unreachable when gatePath is null.
       const result = await spawn([gatePath as string, ...scriptArgs]);
       return {
         exitCode: result.exitCode,
@@ -252,16 +208,6 @@ export function createPreflightGateClient(options?: {
     },
   };
 }
-
-/** Context extractable at the inbound-routing seam for one message. */
-export type BeforeRouteInboundMessageTurnOptions = {
-  gate: PreflightGateClient;
-  actor?: string;
-  agent?: string;
-  capability?: string;
-  route?: string;
-  eventLog?: string;
-};
 
 /**
  * Run the pre-route gate seam for one inbound message. Returns a terminal

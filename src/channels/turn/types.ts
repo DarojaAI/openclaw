@@ -33,9 +33,9 @@ import type { ChatType } from "../chat-type.js";
 import type { InboundEventKind } from "../inbound-event/kind.js";
 import type { CreateChannelReplyPipelineParams } from "../message/reply-pipeline.js";
 import type { InboundLastRouteUpdate, RecordInboundSession } from "../session.types.js";
-import type { BeforeRouteInboundMessageTurnOptions } from "./before-route-inbound-message.js";
 import type { ChannelBotLoopProtectionFacts } from "./bot-loop-protection.js";
 import type { ChannelDeliveryResult } from "./delivery-outcome.js";
+import type { BeforeRouteInboundMessageTurnOptions } from "./preflight-gate-contract.js";
 
 export type { SupplementalContextFacts } from "../../auto-reply/templating.js";
 

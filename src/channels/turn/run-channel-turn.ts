@@ -214,14 +214,11 @@ export async function runChannelTurn<
         admission: routeAdmission,
       });
       emit({
-        ...params,
-        event: {
-          stage: "preflight",
-          event: "drop",
-          messageId: input.id,
-          admission: routeAdmission.kind,
-          reason: routeAdmission.reason,
-        },
+        stage: "preflight",
+        event: "drop",
+        messageId: input.id,
+        admission: routeAdmission.kind,
+        reason: routeAdmission.reason,
       });
       return { admission: routeAdmission, dispatched: false };
     }
