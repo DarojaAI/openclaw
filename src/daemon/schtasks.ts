@@ -1,0 +1,18 @@
+export {
+  restartScheduledTask,
+  resumeScheduledTaskAutoStartAfterUpdate,
+  startScheduledTask,
+  stopScheduledTask,
+  suspendScheduledTaskAutoStartForUpdate,
+} from "./schtasks-control.js";
+export {
+  installScheduledTask,
+  stageScheduledTask,
+  uninstallScheduledTask,
+} from "./schtasks-install.js";
+export { readScheduledTaskCommand, resolveTaskScriptPath } from "./schtasks-layout.js";
+export {
+  isScheduledTaskEnabled,
+  isScheduledTaskInstalled,
+  readScheduledTaskRuntime,
+} from "./schtasks-runtime.js";

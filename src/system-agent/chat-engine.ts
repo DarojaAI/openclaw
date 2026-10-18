@@ -1,0 +1,299 @@
+// OpenClaw chat engine: stable transport-agnostic facade over turn and wizard owners.
+import type {
+  SystemAgentWizardCancel,
+  WizardAnswer,
+} from "../../packages/gateway-protocol/src/index.js";
+import { runOutsidePreparedModelRuntimePluginGenerationScope } from "../agents/prepared-model-runtime-generation-scope.js";
+import type { RuntimeEnv } from "../runtime.js";
+import {
+  cleanupSystemAgentSession,
+  createSystemAgentSession,
+  type SystemAgentSession,
+} from "./agent-turn.js";
+import type { SystemAgentAssistantTurn } from "./assistant.js";
+import {
+  ChatTurnRouter,
+  redactSensitiveCommandText,
+  type SystemAgentChatTurnOptions,
+} from "./chat-turn-router.js";
+import {
+  ChatWizardHost,
+  type ChatWizardHostDependencies,
+  type SystemAgentChatReply,
+} from "./chat-wizard-host.js";
+import type { SystemAgentGreetingPlanner } from "./greeting.js";
+import {
+  SystemAgentInferenceUnavailableError,
+  isSystemAgentInferenceUnavailableError,
+} from "./inference-error.js";
+import {
+  requireSystemAgentInferenceRoute,
+  requireSystemAgentPersistentApplyInference,
+} from "./inference-guard.js";
+import type { SystemAgentOperation } from "./operations.js";
+import {
+  SYSTEM_AGENT_APPROVAL_APPLICATION_UNCONFIRMED_TEXT,
+  SYSTEM_AGENT_APPROVAL_TERMINAL_MESSAGES,
+} from "./operator-approval.js";
+import { loadSystemAgentOverview, type SystemAgentOverview } from "./overview.js";
+import { verifyConfigAfterSystemAgentWrite } from "./post-write-verification.js";
+import type { SystemAgentVerifiedInferenceBinding } from "./verified-inference.js";
+
+export { SystemAgentWizardAnswerError } from "./chat-wizard-host.js";
+
+export type SystemAgentChatEngineOptions = ConstructorParameters<typeof ChatTurnRouter>[0] & {
+  planGreeting?: SystemAgentGreetingPlanner;
+  readonly verifiedInference: SystemAgentVerifiedInferenceBinding;
+};
+
+type SystemAgentChatEngineInternals = {
+  wizardDependencies?: ChatWizardHostDependencies;
+  executeOperation?: typeof import("./operations.js").executeSystemAgentOperation;
+};
+
+/**
+ * One conversation with OpenClaw, independent of transport. The facade owns
+ * serialization, history, and the verified inference session; concept owners
+ * route turns and host setup wizards behind the stable public entrypoint.
+ */
+export class SystemAgentChatEngine {
+  private readonly history: SystemAgentAssistantTurn[] = [];
+  private readonly agentSession: SystemAgentSession;
+  private readonly wizard: ChatWizardHost;
+  private readonly router: ChatTurnRouter;
+  private verifiedInference: SystemAgentVerifiedInferenceBinding;
+  private turnQueue: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    private readonly options: SystemAgentChatEngineOptions,
+    internals: SystemAgentChatEngineInternals = {},
+  ) {
+    const binding = options?.verifiedInference;
+    if (!binding) {
+      throw new SystemAgentInferenceUnavailableError("conversation");
+    }
+    this.verifiedInference = binding;
+    this.agentSession = createSystemAgentSession(binding);
+    this.wizard = new ChatWizardHost({
+      surface: options.surface,
+      beforePersistentApply: async (runtime) => {
+        await this.requirePersistentApplyInference(runtime);
+      },
+      dependencies: internals.wizardDependencies,
+    });
+    this.router = new ChatTurnRouter(
+      options,
+      { executeOperation: internals.executeOperation },
+      this.agentSession,
+      this.wizard,
+      {
+        requireVerifiedInference: async () => await this.requireVerifiedInference(),
+        requirePersistentApplyInference: async (runtime) =>
+          await this.requirePersistentApplyInference(runtime),
+        rebindVerifiedInference: (next) => this.rebindVerifiedInference(next),
+        getVerifiedInference: () => this.verifiedInference,
+        loadOverview: async () => await this.loadOverview(),
+        verifyConfigAfterWrite: async () => await this.verifyConfigAfterWrite(),
+      },
+    );
+  }
+
+  propose(operation: SystemAgentOperation): string {
+    return this.router.propose(operation);
+  }
+
+  getPendingOperatorProposal(): { operation: SystemAgentOperation; hash: string } | null {
+    return this.router.getPendingOperatorProposal();
+  }
+
+  async resolveOperatorApproval(
+    decision: "allow-once" | "allow-always" | "deny" | null,
+    proposalHash: string,
+    beforePersistentApply?: () => void,
+    terminalStatus?: "expired" | "cancelled",
+  ): Promise<SystemAgentChatReply | null> {
+    return await this.enqueueTurn(async () => {
+      const reply = await this.router.resolveOperatorApproval(
+        decision,
+        proposalHash,
+        beforePersistentApply,
+      );
+      if (reply && terminalStatus && !reply.applied) {
+        reply.text = SYSTEM_AGENT_APPROVAL_TERMINAL_MESSAGES[terminalStatus];
+      }
+      if (reply && decision === "allow-once" && !reply.applied) {
+        reply.text += ` ${SYSTEM_AGENT_APPROVAL_APPLICATION_UNCONFIRMED_TEXT}`;
+      }
+      if (reply?.text) {
+        this.history.push({ role: "assistant", text: reply.text });
+      }
+      return reply;
+    });
+  }
+
+  noteAssistantMessage(text: string): void {
+    this.history.push({ role: "assistant", text });
+  }
+
+  seedHistory(turns: readonly SystemAgentAssistantTurn[]): void {
+    this.history.push(
+      ...turns.map((turn) => ({
+        ...turn,
+        text: turn.role === "user" ? redactSensitiveCommandText(turn.text) : turn.text,
+      })),
+    );
+  }
+
+  historyLength(): number {
+    return this.history.length;
+  }
+
+  historySince(index: number): SystemAgentAssistantTurn[] {
+    return this.history.slice(index).map((turn) => ({ role: turn.role, text: turn.text }));
+  }
+
+  async dispose(): Promise<void> {
+    this.wizard.dispose();
+    await cleanupSystemAgentSession(this.agentSession);
+  }
+
+  /**
+   * Project the live hosted-wizard interaction onto a rejoin reply so a
+   * reconnecting client re-renders the answer controls this session still
+   * awaits; a no-op when no wizard is active.
+   */
+  decorateRejoinReply(reply: SystemAgentChatReply): SystemAgentChatReply {
+    return this.wizard.decorateReply(reply);
+  }
+
+  async handle(text: string, options?: SystemAgentChatTurnOptions): Promise<SystemAgentChatReply> {
+    return await this.enqueueTurn(async () => {
+      await this.requireVerifiedInference();
+      const sensitiveTurn = this.wizard.sensitiveInputPending;
+      const reply = await this.router.resolveTurn(text, options);
+      return this.completeTurn(
+        reply,
+        sensitiveTurn ? "<redacted secret>" : redactSensitiveCommandText(text),
+      );
+    });
+  }
+
+  async answerWizard(answer: WizardAnswer): Promise<SystemAgentChatReply> {
+    return await this.enqueueTurn(async () => {
+      await this.requireVerifiedInference();
+      const result = await this.router.answerWizard(this.wizard.answer(answer));
+      return this.completeTurn({ text: result.text, action: "none" }, result.userHistoryText);
+    });
+  }
+
+  async cancelWizard(cancel: SystemAgentWizardCancel): Promise<SystemAgentChatReply> {
+    return await this.enqueueTurn(async () => {
+      const result = await this.router.answerWizard(this.wizard.cancel(cancel));
+      return this.completeTurn({ text: result.text, action: "none" }, result.userHistoryText);
+    });
+  }
+
+  private enqueueTurn<T>(run: () => Promise<T>): Promise<T> {
+    const turn = this.turnQueue.then(run);
+    this.turnQueue = turn.catch(() => undefined);
+    return turn;
+  }
+
+  private completeTurn(reply: SystemAgentChatReply, userHistoryText: string): SystemAgentChatReply {
+    const completed = this.wizard.decorateReply(reply);
+    this.history.push({ role: "user", text: userHistoryText });
+    if (completed.text) {
+      this.history.push({ role: "assistant", text: completed.text });
+    }
+    return completed;
+  }
+
+  async loadOverview(): Promise<SystemAgentOverview> {
+    const route = await this.requireVerifiedInference();
+    const overview = await (this.options.deps?.loadOverview ?? loadSystemAgentOverview)({
+      agentId: route.agentId,
+    });
+    return route.modelTarget === "utility"
+      ? { ...overview, setupModel: route.modelLabel }
+      : { ...overview, defaultModel: route.modelLabel };
+  }
+
+  async planGreeting(
+    params: Parameters<SystemAgentGreetingPlanner>[0],
+  ): ReturnType<SystemAgentGreetingPlanner> {
+    const runPlanner = async () => {
+      const planner = this.options.planGreeting;
+      return planner
+        ? await planner(params)
+        : await import("./assistant.js").then(({ planSystemAgentGreetingWithConfiguredModel }) =>
+            planSystemAgentGreetingWithConfiguredModel({
+              ...params,
+              verifiedInference: this.verifiedInference,
+              deps: this.options.deps,
+            }),
+          );
+    };
+    const requesterAgentId = this.options.requesterAgentId?.trim();
+    const plan =
+      requesterAgentId && requesterAgentId !== this.verifiedInference.execution.agentId
+        ? await runOutsidePreparedModelRuntimePluginGenerationScope(runPlanner)
+        : await runPlanner();
+    if (plan) {
+      await this.requireVerifiedInference();
+    }
+    return plan;
+  }
+
+  private async requireVerifiedInference() {
+    const binding = this.verifiedInference;
+    if (this.agentSession.verifiedInference !== binding) {
+      return this.throwInferenceUnavailable();
+    }
+    return await requireSystemAgentInferenceRoute(
+      binding,
+      this.options.deps,
+      "conversation",
+      (failures) => this.throwInferenceUnavailable(failures),
+    );
+  }
+
+  private async requirePersistentApplyInference(runtime: RuntimeEnv) {
+    const binding = this.verifiedInference;
+    if (this.agentSession.verifiedInference !== binding) {
+      return this.throwInferenceUnavailable();
+    }
+    return await requireSystemAgentPersistentApplyInference(
+      { binding, runtime, deps: this.options.deps },
+      (failures) =>
+        this.throwInferenceUnavailable(
+          isSystemAgentInferenceUnavailableError(failures[0]) ? failures[0].failures : failures,
+          false,
+        ),
+    );
+  }
+
+  private rebindVerifiedInference(binding: SystemAgentVerifiedInferenceBinding): void {
+    if (binding.execution.agentId !== this.verifiedInference.execution.agentId) {
+      return;
+    }
+    delete this.agentSession.cliSession;
+    this.verifiedInference = binding;
+    this.agentSession.verifiedInference = binding;
+  }
+
+  private throwInferenceUnavailable(failures: readonly unknown[] = [], cancelWizard = true): never {
+    this.router.clearForInferenceLoss();
+    delete this.agentSession.cliSession;
+    if (cancelWizard) {
+      this.wizard.dispose();
+    }
+    this.history.splice(0);
+    throw new SystemAgentInferenceUnavailableError("conversation", failures, "route-changed");
+  }
+
+  private async verifyConfigAfterWrite(): Promise<string | null> {
+    return await verifyConfigAfterSystemAgentWrite((message) =>
+      this.router.resolveAssistantTurn(message, false),
+    );
+  }
+}

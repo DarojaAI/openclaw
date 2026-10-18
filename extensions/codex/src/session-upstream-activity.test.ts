@@ -1,0 +1,228 @@
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import type { SessionUpstreamProbe } from "openclaw/plugin-sdk/session-catalog";
+import { describe, expect, it, vi } from "vitest";
+import { CodexAppServerRpcError } from "./app-server/client.js";
+import type { CodexTurn } from "./app-server/protocol.js";
+import type { CodexAppServerBindingStore } from "./app-server/session-binding.js";
+import type {
+  CodexSessionCatalogControl,
+  CodexSessionCatalogControlFactory,
+} from "./session-catalog-types.js";
+import { createChecker } from "./session-upstream-activity.js";
+
+function probe(overrides: Partial<SessionUpstreamProbe> = {}): SessionUpstreamProbe {
+  return {
+    sessionKey: "agent:main:adopted:codex",
+    agentId: "main",
+    threadId: "thread-1",
+    hostId: "gateway:local",
+    upstreamKind: "codex-app-server",
+    upstreamRef: { connectionFingerprint: "connection-1", threadId: "thread-1" },
+    marker: { turnId: "turn-1", userMessageCount: 1 },
+    ownRecentUserTexts: [],
+    ...overrides,
+  };
+}
+
+function turn(id: string, itemTypes: string[], startedAt: number): CodexTurn {
+  return {
+    id,
+    startedAt,
+    items: itemTypes.map((type, index) => ({
+      id: `${id}-item-${index}`,
+      type,
+      text: type === "userMessage" ? `${id} prompt ${index}` : "",
+    })) as CodexTurn["items"],
+  };
+}
+
+function createControl(overrides: Partial<CodexSessionCatalogControl> = {}) {
+  const withPinnedConnection = vi.fn(
+    async (run: (value: CodexSessionCatalogControl) => Promise<unknown>) => await run(control),
+  ) as unknown as CodexSessionCatalogControl["withPinnedConnection"];
+  const control = {
+    connectionFingerprint: "connection-1",
+    withPinnedConnection,
+    listPage: vi.fn(async () => ({ sessions: [] })),
+    listDescendantPage: vi.fn(async () => ({ data: [] })),
+    listTurnPage: vi.fn(async () => ({ data: [] })),
+    readThread: vi.fn(async (threadId: string) => ({ id: threadId }) as never),
+    archiveThread: vi.fn(async () => undefined),
+    ...overrides,
+  } as CodexSessionCatalogControl;
+  return control;
+}
+
+function createActivityChecker(params: {
+  control: CodexSessionCatalogControl;
+  sessionId?: string;
+  binding?: {
+    threadId: string;
+    connectionScope?: "supervision";
+    supervisionSourceThreadId?: string;
+  };
+}) {
+  const api = {
+    runtime: {
+      agent: {
+        session: {
+          resolveStorePath: () => "/activity-store",
+          getSessionEntryAsync: async () =>
+            params.sessionId ? { sessionId: params.sessionId } : undefined,
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+  const bindingStore = {
+    readAsync: vi.fn(async () => params.binding),
+  } as unknown as CodexAppServerBindingStore;
+  return createChecker({
+    api,
+    bindingStore,
+    control: {
+      hasActiveWork: () => false,
+      disconnect: async () => {},
+      forRequest: () => params.control,
+      forNode: async () => {
+        throw new Error("Node source is outside this local activity fixture");
+      },
+      homesForAgent: async () => [],
+      forUpstream: async () => params.control,
+    } satisfies CodexSessionCatalogControlFactory,
+    getRuntimeConfig: () => undefined,
+  });
+}
+
+async function checkTurns(params: { probe: SessionUpstreamProbe; turns: CodexTurn[] }) {
+  const control = createControl({
+    listTurnPage: vi.fn(async () => ({ data: params.turns })),
+  });
+  return await createActivityChecker({ control })([params.probe]);
+}
+
+describe("Codex upstream activity", () => {
+  it("keeps a rolled-back thread linked when thread/read succeeds", async () => {
+    const readThread = vi.fn(async () => ({}) as never);
+    const control = createControl({
+      listTurnPage: async () => ({ data: [] }),
+      readThread,
+    });
+    const checkUpstreamActivity = createActivityChecker({
+      control,
+      sessionId: "session-1",
+      binding: {
+        threadId: "thread-canonical",
+        connectionScope: "supervision",
+        supervisionSourceThreadId: "thread-1",
+      },
+    });
+
+    await expect(checkUpstreamActivity([probe()])).resolves.toEqual([]);
+    expect(readThread).toHaveBeenCalledWith("thread-canonical", false);
+  });
+
+  it.each(["missing"] as const)(
+    "verifies missing threads after a %s turn-page response",
+    async (outcome) => {
+      const readThread = vi.fn(async () => {
+        throw new CodexAppServerRpcError(
+          { code: -32600, message: "thread not loaded: thread-1" },
+          "thread/read",
+        );
+      });
+      const control = createControl({
+        listTurnPage: async () => {
+          if (outcome === "missing") {
+            throw new CodexAppServerRpcError(
+              { code: -32600, message: "thread not loaded: thread-1" },
+              "thread/turns/list",
+            );
+          }
+          return { data: [] };
+        },
+        readThread,
+      });
+
+      await expect(createActivityChecker({ control })([probe()])).resolves.toEqual([
+        { kind: "missing", sessionKey: "agent:main:adopted:codex" },
+      ]);
+      expect(readThread).toHaveBeenCalledWith("thread-1", false);
+    },
+  );
+
+  it.each([
+    new CodexAppServerRpcError({ code: -32603, message: "store hiccup" }, "thread/turns/list"),
+  ])(
+    "keeps a failed turns read inconclusive without another request: $message",
+    async (failure) => {
+      const readThread = vi.fn();
+      const control = createControl({
+        listTurnPage: async ({ threadId }) => {
+          if (threadId === "thread-stale") {
+            throw failure;
+          }
+          return { data: [turn("turn-2", ["userMessage"], 200), turn("turn-1", [], 100)] };
+        },
+        readThread,
+      });
+
+      await expect(
+        createActivityChecker({ control })([
+          probe({ threadId: "thread-stale" }),
+          probe({ sessionKey: "healthy" }),
+        ]),
+      ).resolves.toEqual([expect.objectContaining({ sessionKey: "healthy" })]);
+      expect(readThread).not.toHaveBeenCalled();
+    },
+  );
+
+  it("upgrades a legacy turn marker without reporting existing steers", async () => {
+    await expect(
+      checkTurns({
+        probe: probe({ marker: { turnId: "turn-1" } }),
+        turns: [turn("turn-1", ["userMessage", "agentMessage", "userMessage"], 100)],
+      }),
+    ).resolves.toEqual([
+      {
+        kind: "activity",
+        sessionKey: "agent:main:adopted:codex",
+        humanTurns: 0,
+        nextMarker: { turnId: "turn-1", userMessageCount: 2 },
+      },
+    ]);
+  });
+
+  it("filters a batched OpenClaw steer by its component transcript texts", async () => {
+    await expect(
+      checkTurns({
+        probe: probe({
+          marker: { turnId: "turn-1", userMessageCount: 0 },
+          ownRecentUserTexts: ["first steer", "second steer"],
+        }),
+        turns: [
+          {
+            ...turn("turn-1", [], 100),
+            items: [
+              {
+                id: "user-1",
+                type: "userMessage",
+                text: "",
+                content: [
+                  { type: "text", text: " first   steer ", text_elements: [] },
+                  { type: "text", text: "second steer", text_elements: [] },
+                ],
+              } as unknown as CodexTurn["items"][number],
+            ],
+          },
+        ],
+      }),
+    ).resolves.toEqual([
+      {
+        kind: "activity",
+        sessionKey: "agent:main:adopted:codex",
+        humanTurns: 0,
+        nextMarker: { turnId: "turn-1", userMessageCount: 1 },
+      },
+    ]);
+  });
+});

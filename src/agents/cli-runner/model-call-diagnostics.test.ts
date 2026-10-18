@@ -1,0 +1,286 @@
+// Verifies Claude CLI model diagnostics stay listener-gated and memory-bounded.
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  onTrustedInternalDiagnosticEvent,
+  resetDiagnosticEventsForTest,
+  waitForDiagnosticEventsDrained,
+  type DiagnosticEventPrivateData,
+} from "../../infra/diagnostic-events.js";
+import type { CliOutput } from "../cli-output-contracts.js";
+import { createClaudeCliModelCallDiagnostics } from "./model-call-diagnostics.js";
+import type { PreparedCliRunContext } from "./types.js";
+
+const CONTENT_LIMIT_BYTES = 128 * 1024;
+
+function createContext(): PreparedCliRunContext {
+  return {
+    backendResolved: { id: "claude-cli", modelProvider: "anthropic" },
+    contextWindowInfo: undefined,
+    normalizedModel: "claude-test",
+    params: {
+      config: {
+        diagnostics: {
+          enabled: true,
+          otel: {
+            enabled: true,
+            traces: true,
+            captureContent: true,
+          },
+        },
+      },
+      runId: "claude-diagnostics-test",
+      agentId: "claude-diagnostics-agent",
+      sessionId: "session-test",
+    },
+  } as PreparedCliRunContext;
+}
+
+function createOutputDiagnostics(captureOutputMessages: (messages: unknown) => void) {
+  const stop = onTrustedInternalDiagnosticEvent((event, _metadata, privateData) => {
+    if (event.type === "model.call.completed") {
+      captureOutputMessages(privateData.modelContent?.outputMessages);
+    }
+  });
+  const diagnostics = expectDefined(
+    createClaudeCliModelCallDiagnostics({
+      context: createContext(),
+      prompt: "hello",
+      transport: "stdio",
+    }),
+    "Claude CLI diagnostics",
+  );
+  return { diagnostics, stop };
+}
+
+describe("Claude CLI model-call diagnostics", () => {
+  beforeEach(() => {
+    resetDiagnosticEventsForTest();
+  });
+
+  afterEach(() => {
+    resetDiagnosticEventsForTest();
+  });
+
+  it("does not create diagnostics without an active event listener", () => {
+    expect(
+      createClaudeCliModelCallDiagnostics({
+        context: createContext(),
+        prompt: "hello",
+        transport: "stdio",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("bounds large prompt and assistant content during a burst", async () => {
+    let completedPrivateData: DiagnosticEventPrivateData | undefined;
+    const stop = onTrustedInternalDiagnosticEvent((event, _metadata, privateData) => {
+      if (event.type === "model.call.completed") {
+        completedPrivateData = privateData;
+      }
+    });
+    const largeText = "€".repeat(256 * 1024);
+    const diagnostics = expectDefined(
+      createClaudeCliModelCallDiagnostics({
+        context: createContext(),
+        prompt: largeText,
+        systemPrompt: largeText,
+        transport: "stdio",
+      }),
+      "Claude CLI diagnostics",
+    );
+
+    diagnostics.emitStarted();
+    for (let index = 0; index < 250; index += 1) {
+      diagnostics.observeAssistantMessage({
+        content: [{ type: "text", text: `${index}:${largeText}` }],
+      });
+    }
+    diagnostics.emitCompleted({ text: "done" } as CliOutput);
+    await waitForDiagnosticEventsDrained();
+    stop();
+
+    const modelContent = expectDefined(completedPrivateData?.modelContent, "model content");
+    const inputJson = JSON.stringify(modelContent.inputMessages);
+    const outputJson = JSON.stringify(modelContent.outputMessages);
+    expect(Buffer.byteLength(inputJson, "utf8")).toBeLessThanOrEqual(CONTENT_LIMIT_BYTES + 256);
+    expect(Buffer.byteLength(modelContent.systemPrompt ?? "", "utf8")).toBeLessThanOrEqual(
+      CONTENT_LIMIT_BYTES,
+    );
+    expect(Buffer.byteLength(outputJson, "utf8")).toBeLessThanOrEqual(CONTENT_LIMIT_BYTES);
+    expect(outputJson).toContain("...(truncated)");
+  });
+
+  it("bounds serialized escaped content across many envelopes", async () => {
+    let outputMessages: unknown;
+    const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+      outputMessages = messages;
+    });
+
+    diagnostics.emitStarted();
+    for (let index = 0; index < 199; index += 1) {
+      diagnostics.observeAssistantMessage({ content: `part-${index}:\u0000`.repeat(100) });
+    }
+    diagnostics.emitCompleted({ text: "done" } as CliOutput);
+    await waitForDiagnosticEventsDrained();
+    stop();
+
+    expect(Buffer.byteLength(JSON.stringify(outputMessages), "utf8")).toBeLessThanOrEqual(
+      CONTENT_LIMIT_BYTES,
+    );
+  });
+
+  it("keeps fallback response text when prior non-text envelopes fill the limit", async () => {
+    let outputMessages: unknown;
+    const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+      outputMessages = messages;
+    });
+
+    diagnostics.emitStarted();
+    for (let index = 0; index < 200; index += 1) {
+      diagnostics.observeAssistantMessage({
+        content: [{ type: "thinking", thinking: `reason-${index}` }],
+      });
+    }
+    diagnostics.emitCompleted({ text: "final visible answer" } as CliOutput);
+    await waitForDiagnosticEventsDrained();
+    stop();
+
+    expect(outputMessages).toHaveLength(200);
+    expect(JSON.stringify(outputMessages)).toContain("final visible answer");
+    expect(JSON.stringify(outputMessages)).toContain("...(truncated)");
+  });
+
+  it("keeps fallback response text when non-text content fills the byte budget", async () => {
+    let outputMessages: unknown;
+    const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+      outputMessages = messages;
+    });
+
+    diagnostics.emitStarted();
+    diagnostics.observeAssistantMessage({
+      content: [{ type: "thinking", thinking: "€".repeat(256 * 1024) }],
+    });
+    diagnostics.emitCompleted({ text: "final visible answer" } as CliOutput);
+    await waitForDiagnosticEventsDrained();
+    stop();
+
+    const outputJson = JSON.stringify(outputMessages);
+    expect(outputJson).toContain("final visible answer");
+    expect(outputJson).toContain("...(truncated)");
+    expect(Buffer.byteLength(outputJson, "utf8")).toBeLessThanOrEqual(CONTENT_LIMIT_BYTES + 512);
+  });
+
+  it.each([{ content: "" }, { content: [{ type: "text", text: "" }] }])(
+    "keeps the fallback reserve after empty text content (%j)",
+    async ({ content }) => {
+      let outputMessages: unknown;
+      const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+        outputMessages = messages;
+      });
+
+      diagnostics.emitStarted();
+      diagnostics.observeAssistantMessage({ content });
+      diagnostics.observeAssistantMessage({
+        content: Array.from({ length: 200 }, (_, index) => ({
+          type: "thinking",
+          thinking: `reason-${index}`,
+        })),
+      });
+      diagnostics.emitCompleted({ text: "final visible answer" } as CliOutput);
+      await waitForDiagnosticEventsDrained();
+      stop();
+
+      const outputJson = JSON.stringify(outputMessages);
+      expect(outputJson).toContain("final visible answer");
+      expect(outputJson).toContain("...(truncated)");
+    },
+  );
+
+  it.each(["tool_use", "server_tool_use", "mcp_tool_use"])(
+    "captures visible assistant content without opaque %s fields",
+    async (toolType) => {
+      let outputMessages: unknown;
+      const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+        outputMessages = messages;
+      });
+      diagnostics.emitStarted();
+      diagnostics.observeAssistantMessage({
+        content: [
+          { type: "text", text: "Visible reply" },
+          { type: "thinking", thinking: "Visible reasoning", signature: "opaque-signature" },
+          { type: toolType, name: "lookup", id: "call-1", input: { hidden: "tool arguments" } },
+          { type: "text", text: 42 },
+          null,
+        ],
+        stop_reason: "tool_use",
+      });
+      diagnostics.emitCompleted({ text: "Visible reply" } as CliOutput);
+      await waitForDiagnosticEventsDrained();
+      stop();
+
+      expect(outputMessages).toEqual([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Visible reply" },
+            { type: "thinking", thinking: "Visible reasoning" },
+            { type: "tool_call", name: "lookup", id: "call-1" },
+          ],
+          stopReason: "tool_use",
+        },
+      ]);
+    },
+  );
+
+  it("bounds text probing after the capture budget is exhausted", async () => {
+    let outputMessages: unknown;
+    const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+      outputMessages = messages;
+    });
+
+    diagnostics.emitStarted();
+    diagnostics.observeAssistantMessage({
+      content: Array.from({ length: 198 }, (_, index) => ({
+        type: "thinking",
+        thinking: `reason-${index}`,
+      })),
+    });
+    diagnostics.observeAssistantMessage({
+      content: [
+        ...Array.from({ length: 10_000 }, () => ({ type: "thinking", thinking: "later" })),
+        { type: "text", text: "outside-probe-window" },
+      ],
+    });
+    diagnostics.emitCompleted({ text: "final visible answer" } as CliOutput);
+    await waitForDiagnosticEventsDrained();
+    stop();
+
+    const outputJson = JSON.stringify(outputMessages);
+    expect(outputJson).toContain("final visible answer");
+    expect(outputJson).not.toContain("outside-probe-window");
+  });
+
+  it("counts the truncation marker within the output item limit", async () => {
+    let outputMessages: unknown;
+    const { diagnostics, stop } = createOutputDiagnostics((messages) => {
+      outputMessages = messages;
+    });
+
+    diagnostics.emitStarted();
+    diagnostics.observeAssistantMessage({
+      content: Array.from({ length: 201 }, (_, index) => ({
+        type: "text",
+        text: `part-${index}`,
+      })),
+    });
+    diagnostics.emitCompleted({ text: "done" } as CliOutput);
+    await waitForDiagnosticEventsDrained();
+    stop();
+
+    const messages = outputMessages as Array<{ content?: unknown[] }>;
+    const itemCount = messages.reduce((sum, message) => sum + (message.content?.length ?? 0), 0);
+    expect(itemCount).toBe(200);
+    expect(JSON.stringify(messages)).toContain("...(truncated)");
+  });
+});

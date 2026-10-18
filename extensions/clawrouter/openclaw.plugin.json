@@ -1,0 +1,62 @@
+{
+  "id": "clawrouter",
+  "categories": [
+    "models"
+  ],
+  "activation": {
+    "onStartup": false,
+    "onConfigPaths": [
+      "models.providers.clawrouter"
+    ]
+  },
+  "enabledByDefault": true,
+  "providers": [
+    "clawrouter"
+  ],
+  "contracts": {
+    "usageProviders": [
+      "clawrouter"
+    ]
+  },
+  "setup": {
+    "providers": [
+      {
+        "id": "clawrouter",
+        "envVars": [
+          "CLAWROUTER_API_KEY"
+        ]
+      }
+    ]
+  },
+  "providerAuthChoices": [
+    {
+      "provider": "clawrouter",
+      "method": "api-key",
+      "choiceId": "clawrouter-api-key",
+      "choiceLabel": "ClawRouter proxy key",
+      "choiceHint": "Approved models through one managed key",
+      "groupId": "clawrouter",
+      "groupLabel": "ClawRouter",
+      "groupHint": "Managed model access and quotas",
+      "optionKey": "clawrouterApiKey",
+      "cliFlag": "--clawrouter-api-key",
+      "cliOption": "--clawrouter-api-key <key>",
+      "cliDescription": "ClawRouter proxy key"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "uiCapabilities": [
+    "page",
+    "navigation"
+  ],
+  "controlUi": {
+    "entry": "dist/control-ui/58dc1ca82e99f3402ac0361b455184ab67224ad535f0ffa12b5234c9170eac45/index.js",
+    "styles": [
+      "dist/control-ui/58dc1ca82e99f3402ac0361b455184ab67224ad535f0ffa12b5234c9170eac45/index.css"
+    ]
+  }
+}

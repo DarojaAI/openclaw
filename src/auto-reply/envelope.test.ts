@@ -1,0 +1,187 @@
+/** Tests inbound envelope formatting, timestamps, and sender labels. */
+import { describe, expect, it } from "vitest";
+import {
+  formatAgentEnvelope,
+  formatAgentEnvelopeTimestamp,
+  formatInboundEnvelope,
+  resolveEnvelopeFormatOptions,
+} from "./envelope.js";
+
+describe("formatAgentEnvelope", () => {
+  it("includes channel, from, ip, host, and timestamp", () => {
+    const ts = Date.UTC(2025, 0, 2, 3, 4, 5); // 2025-01-02T03:04:05Z
+    const body = formatAgentEnvelope({
+      channel: "WebChat",
+      from: "user1",
+      host: "mac-mini",
+      ip: "10.0.0.5",
+      timestamp: ts,
+      envelope: { timezone: "utc" },
+      body: "hello",
+    });
+
+    expect(body).toBe("[WebChat user1 mac-mini 10.0.0.5 Thu 2025-01-02T03:04:05Z] hello");
+  });
+
+  it("formats timestamps in local timezone by default", () => {
+    const ts = Date.UTC(2025, 0, 2, 3, 4);
+    const expectedTimestamp = formatAgentEnvelopeTimestamp(ts, { timezone: "local" });
+    const body = formatAgentEnvelope({
+      channel: "WebChat",
+      timestamp: ts,
+      body: "hello",
+    });
+
+    expect(body).toBe(`[WebChat ${expectedTimestamp}] hello`);
+  });
+
+  it("formats timestamps in UTC across date boundaries", () => {
+    for (const [timestamp, timezone, expected] of [
+      ["2025-01-02T03:04:05Z", "utc", "Thu 2025-01-02T03:04:05Z"],
+      ["2024-12-31T23:59:59Z", "utc", "Tue 2024-12-31T23:59:59Z"],
+      ["2025-01-01T00:00:00Z", "gmt", "Wed 2025-01-01T00:00:00Z"],
+      ["2025-01-03T00:00:00Z", "utc", "Fri 2025-01-03T00:00:00Z"],
+    ] as const) {
+      expect(
+        formatAgentEnvelope({
+          channel: "WebChat",
+          timestamp: new Date(timestamp),
+          envelope: { timezone },
+          body: "hello",
+        }),
+      ).toBe(`[WebChat ${expected}] hello`);
+    }
+  });
+
+  it("formats timestamps in user timezone when configured", () => {
+    const ts = Date.UTC(2025, 0, 2, 3, 4, 5); // 2025-01-02T03:04:05Z (04:04:05 CET)
+    const body = formatAgentEnvelope({
+      channel: "WebChat",
+      timestamp: ts,
+      envelope: { timezone: "user", userTimezone: "Europe/Vienna" },
+      body: "hello",
+    });
+
+    expect(body).toMatch(/\[WebChat Thu 2025-01-02 04:04:05 [^\]]+\] hello/);
+  });
+
+  it("falls back to the host timezone for an invalid configured user timezone", () => {
+    const ts = Date.UTC(2025, 0, 2, 3, 4, 5);
+    const options = resolveEnvelopeFormatOptions({
+      agents: { defaults: { userTimezone: "Not/A_Timezone" } },
+    });
+    expect(options.timezone).toBe("local");
+    expect(formatAgentEnvelopeTimestamp(ts, options)).toBe(
+      formatAgentEnvelopeTimestamp(ts, { timezone: "local" }),
+    );
+  });
+
+  it("keeps the UTC fallback for an invalid explicit timezone option", () => {
+    const ts = Date.UTC(2025, 0, 2, 3, 4, 5);
+    expect(formatAgentEnvelopeTimestamp(ts, { timezone: "Not/A_Timezone" })).toBe(
+      formatAgentEnvelopeTimestamp(ts, { timezone: "utc" }),
+    );
+  });
+});
+
+describe("formatInboundEnvelope", () => {
+  it("uses sender fields when senderLabel is missing", () => {
+    const body = formatInboundEnvelope({
+      channel: "Signal",
+      from: "Signal Group id:123",
+      body: "ping",
+      chatType: "group",
+      sender: { name: "Bob", id: "42" },
+    });
+    expect(body).toBe("[Signal Signal Group id:123] Bob (42): ping");
+  });
+
+  it("uses display text for direct body prefixes when from includes an id", () => {
+    const body = formatInboundEnvelope({
+      channel: "Telegram",
+      from: "Alice id:123",
+      body: "hello",
+      chatType: "direct",
+    });
+    expect(body).toBe("[Telegram Alice id:123] Alice: hello");
+  });
+
+  it("uses a stable direct body prefix when id display text contains a colon", () => {
+    const body = formatInboundEnvelope({
+      channel: "Telegram",
+      from: "Ops: Alice id:123",
+      body: "/status",
+      chatType: "direct",
+    });
+    expect(body).toBe("[Telegram Ops: Alice id:123] (sender): /status");
+  });
+
+  it("includes elapsed time when previousTimestamp is provided", () => {
+    const now = Date.now();
+    const twoMinutesAgo = now - 2 * 60 * 1000;
+    const body = formatInboundEnvelope({
+      channel: "Telegram",
+      from: "Alice",
+      body: "follow-up message",
+      timestamp: now,
+      previousTimestamp: twoMinutesAgo,
+      chatType: "direct",
+      envelope: { includeTimestamp: false },
+    });
+    expect(body).toContain("Alice +2m");
+    expect(body).toContain("follow-up message");
+  });
+
+  it("omits elapsed time when disabled", () => {
+    const now = Date.now();
+    const body = formatInboundEnvelope({
+      channel: "Telegram",
+      from: "Alice",
+      body: "follow-up message",
+      timestamp: now,
+      previousTimestamp: now - 2 * 60 * 1000,
+      chatType: "direct",
+      envelope: { includeElapsed: false, includeTimestamp: false },
+    });
+    expect(body).toBe("[Telegram Alice] Alice: follow-up message");
+  });
+
+  it("prefixes DM body with (self) when fromMe is true", () => {
+    const body = formatInboundEnvelope({
+      channel: "WhatsApp",
+      from: "+1555",
+      body: "outbound msg",
+      chatType: "direct",
+      fromMe: true,
+    });
+    expect(body).toBe("[WhatsApp +1555] (self): outbound msg");
+  });
+
+  it("does not prefix group messages with (self) when fromMe is true", () => {
+    const body = formatInboundEnvelope({
+      channel: "WhatsApp",
+      from: "Family Chat",
+      body: "hello",
+      chatType: "group",
+      senderLabel: "Alice",
+      fromMe: true,
+    });
+    expect(body).toBe("[WhatsApp Family Chat] Alice: hello");
+  });
+
+  it("uses fixed envelope options while preserving the user timezone", () => {
+    const options = resolveEnvelopeFormatOptions({
+      agents: {
+        defaults: {
+          userTimezone: "Europe/Vienna",
+        },
+      },
+    });
+    expect(options).toEqual({
+      timezone: "Europe/Vienna",
+      includeTimestamp: true,
+      includeElapsed: true,
+      userTimezone: "Europe/Vienna",
+    });
+  });
+});

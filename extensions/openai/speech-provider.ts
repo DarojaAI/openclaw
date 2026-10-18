@@ -1,0 +1,264 @@
+import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
+import type { SpeechProviderPlugin, SpeechSynthesisRequest } from "openclaw/plugin-sdk/speech-core";
+import {
+  createSpeechDirectiveParser,
+  parseSpeechDirectiveNumberOverride,
+} from "openclaw/plugin-sdk/speech-provider";
+import {
+  asFiniteNumber,
+  asOptionalRecord,
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveOpenAIProviderConfigRecord } from "./realtime-provider-shared.js";
+import {
+  DEFAULT_OPENAI_BASE_URL,
+  isCustomOpenAITtsBaseUrl,
+  isValidOpenAIModel,
+  isValidOpenAIVoice,
+  normalizeOpenAITtsBaseUrl,
+  OPENAI_TTS_MODELS,
+  OPENAI_TTS_VOICES,
+  openaiTTS,
+} from "./tts.js";
+
+const OPENAI_SPEECH_RESPONSE_FORMATS = ["mp3", "opus", "wav"] as const;
+
+type OpenAiSpeechResponseFormat = (typeof OPENAI_SPEECH_RESPONSE_FORMATS)[number];
+
+function resolveOpenAISpeechApiKey(
+  config: Partial<Pick<ReturnType<typeof normalizeOpenAIProviderConfig>, "apiKey">>,
+): string | undefined {
+  return (
+    normalizeOptionalString(config.apiKey) ?? normalizeOptionalString(process.env.OPENAI_API_KEY)
+  );
+}
+
+function normalizeOpenAISpeechResponseFormat(
+  value: unknown,
+): OpenAiSpeechResponseFormat | undefined {
+  const next = normalizeOptionalLowercaseString(value);
+  if (!next) {
+    return undefined;
+  }
+  const format = OPENAI_SPEECH_RESPONSE_FORMATS.find((candidate) => candidate === next);
+  if (format) {
+    return format;
+  }
+  throw new Error(`Invalid OpenAI speech responseFormat: ${next}`);
+}
+
+function isGroqSpeechBaseUrl(baseUrl: string): boolean {
+  const hostname = normalizeLowercaseStringOrEmpty(URL.parse(baseUrl)?.hostname);
+  return hostname === "groq.com" || hostname.endsWith(".groq.com");
+}
+
+function resolveSpeechResponseFormat(
+  baseUrl: string,
+  target: "audio-file" | "voice-note" | "telephony",
+  configuredFormat?: OpenAiSpeechResponseFormat,
+): OpenAiSpeechResponseFormat {
+  if (configuredFormat) {
+    return configuredFormat;
+  }
+  if (isGroqSpeechBaseUrl(baseUrl)) {
+    return "wav";
+  }
+  return target === "voice-note" ? "opus" : "mp3";
+}
+
+function readExtraBody(value: unknown): Record<string, unknown> | undefined {
+  const body = asOptionalRecord(value);
+  if (!body || Object.keys(body).length === 0) {
+    return undefined;
+  }
+  return body;
+}
+
+function normalizeOpenAISpeechSpeed(value: unknown, baseUrl?: string): number | undefined {
+  const speed = asFiniteNumber(value);
+  if (speed === undefined) {
+    return undefined;
+  }
+  if (baseUrl !== undefined && normalizeOpenAITtsBaseUrl(baseUrl) !== DEFAULT_OPENAI_BASE_URL) {
+    return speed;
+  }
+  return speed >= 0.25 && speed <= 4 ? speed : undefined;
+}
+
+function normalizeOpenAIProviderConfig(
+  config: Record<string, unknown>,
+  source: "raw" | "resolved" = "raw",
+) {
+  const raw = source === "raw" ? resolveOpenAIProviderConfigRecord(config) : config;
+  const configuredBaseUrl = normalizeOptionalString(raw.baseUrl);
+  const defaultBaseUrl =
+    normalizeOptionalString(process.env.OPENAI_TTS_BASE_URL) ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl =
+    source === "raw"
+      ? normalizeOpenAITtsBaseUrl(configuredBaseUrl ?? defaultBaseUrl)
+      : (configuredBaseUrl ?? normalizeOpenAITtsBaseUrl(defaultBaseUrl));
+  return {
+    apiKey:
+      source === "raw"
+        ? normalizeResolvedSecretInputString({
+            value: raw.apiKey,
+            path: "tts.providers.openai.apiKey",
+          })
+        : normalizeOptionalString(raw.apiKey),
+    baseUrl,
+    model: normalizeOptionalString(raw.model) ?? "gpt-4o-mini-tts",
+    voice: normalizeOptionalString(raw.voice) ?? "coral",
+    speed: normalizeOpenAISpeechSpeed(raw.speed, baseUrl),
+    instructions: normalizeOptionalString(raw.instructions),
+    responseFormat: normalizeOpenAISpeechResponseFormat(raw.responseFormat),
+    extraBody: readExtraBody(raw.extraBody) ?? readExtraBody(raw.extra_body),
+  };
+}
+
+const parseDirectiveToken = createSpeechDirectiveParser({
+  voice: [
+    "allowVoice",
+    ["voice", "openai_voice", "openaivoice"],
+    {
+      parse: (ctx) =>
+        isValidOpenAIVoice(ctx.value, normalizeOptionalString(ctx.providerConfig?.baseUrl))
+          ? { handled: true, overrides: { voice: ctx.value } }
+          : { handled: true, warnings: [`invalid OpenAI voice "${ctx.value}"`] },
+    },
+  ],
+  model: [
+    "allowModelId",
+    ["model", "openai_model", "openaimodel"],
+    {
+      parse: (ctx) =>
+        isValidOpenAIModel(ctx.value, normalizeOptionalString(ctx.providerConfig?.baseUrl))
+          ? { handled: true, overrides: { model: ctx.value } }
+          : { handled: false },
+    },
+  ],
+  speed: [
+    "allowVoiceSettings",
+    ["speed", "openai_speed", "openaispeed"],
+    {
+      parse: (ctx) => {
+        const customBaseUrl = isCustomOpenAITtsBaseUrl(
+          normalizeOptionalString(ctx.providerConfig?.baseUrl),
+        );
+        return parseSpeechDirectiveNumberOverride({
+          ctx,
+          overrideKey: "speed",
+          range: customBaseUrl ? {} : { min: 0.25, max: 4 },
+          warning: (value) =>
+            customBaseUrl
+              ? `invalid OpenAI-compatible speed "${value}"`
+              : `invalid OpenAI speed "${value}" (0.25-4.0)`,
+        });
+      },
+    },
+  ],
+});
+
+async function resolveOpenAITtsRequest(
+  req: SpeechSynthesisRequest,
+  responseFormatOverride?: "pcm",
+): Promise<Parameters<typeof openaiTTS>[0]> {
+  const config = normalizeOpenAIProviderConfig(req.providerConfig, "resolved");
+  const model = normalizeOptionalString(req.providerOverrides?.model) ?? config.model;
+  const voice = normalizeOptionalString(req.providerOverrides?.voice) ?? config.voice;
+  const speed =
+    normalizeOpenAISpeechSpeed(req.providerOverrides?.speed, config.baseUrl) ?? config.speed;
+  const apiKey = resolveOpenAISpeechApiKey(config);
+  if (!apiKey) {
+    throw new Error("OpenAI API key missing");
+  }
+  const responseFormat =
+    responseFormatOverride ??
+    resolveSpeechResponseFormat(config.baseUrl, req.target, config.responseFormat);
+  const { resolveGeneratedMediaMaxBytes } =
+    await import("openclaw/plugin-sdk/media-generation-runtime");
+  return {
+    text: req.text,
+    apiKey,
+    baseUrl: config.baseUrl,
+    model,
+    voice,
+    speed,
+    instructions: config.instructions,
+    responseFormat,
+    extraBody: config.extraBody,
+    timeoutMs: req.timeoutMs,
+    maxBytes: resolveGeneratedMediaMaxBytes(req.cfg, "audio"),
+  };
+}
+
+export function buildOpenAISpeechProvider(): SpeechProviderPlugin {
+  const isConfigured: NonNullable<SpeechProviderPlugin["isConfigured"]> = ({ providerConfig }) =>
+    Boolean(resolveOpenAISpeechApiKey(normalizeOpenAIProviderConfig(providerConfig, "resolved")));
+  return {
+    id: "openai",
+    label: "OpenAI",
+    autoSelectOrder: 10,
+    defaultModel: OPENAI_TTS_MODELS[0],
+    models: OPENAI_TTS_MODELS,
+    voices: OPENAI_TTS_VOICES,
+    resolveConfig: ({ rawConfig }) => normalizeOpenAIProviderConfig(rawConfig),
+    parseDirectiveToken,
+    resolveTalkConfig: ({ baseTtsConfig, talkProviderConfig }) => {
+      const base = normalizeOpenAIProviderConfig(baseTtsConfig);
+      const responseFormat = normalizeOpenAISpeechResponseFormat(talkProviderConfig.responseFormat);
+      const baseUrl = normalizeOptionalString(talkProviderConfig.baseUrl) ?? base.baseUrl;
+      const speed = normalizeOpenAISpeechSpeed(talkProviderConfig.speed, baseUrl);
+      return {
+        ...base,
+        ...(talkProviderConfig.apiKey === undefined
+          ? {}
+          : {
+              apiKey: normalizeResolvedSecretInputString({
+                value: talkProviderConfig.apiKey,
+                path: "talk.providers.openai.apiKey",
+              }),
+            }),
+        baseUrl,
+        model: normalizeOptionalString(talkProviderConfig.modelId) ?? base.model,
+        voice: normalizeOptionalString(talkProviderConfig.voiceId) ?? base.voice,
+        speed: speed ?? base.speed,
+        instructions: normalizeOptionalString(talkProviderConfig.instructions) ?? base.instructions,
+        responseFormat: responseFormat ?? base.responseFormat,
+      };
+    },
+    resolveTalkOverrides: ({ params }) => ({
+      ...(normalizeOptionalString(params.voiceId) == null
+        ? {}
+        : { voice: normalizeOptionalString(params.voiceId) }),
+      ...(normalizeOptionalString(params.modelId) == null
+        ? {}
+        : { model: normalizeOptionalString(params.modelId) }),
+      ...(asFiniteNumber(params.speed) == null ? {} : { speed: asFiniteNumber(params.speed) }),
+    }),
+    listVoices: async () => OPENAI_TTS_VOICES.map((voice) => ({ id: voice, name: voice })),
+    // Retained for synchronous SDK consumers through 2026-12-31.
+    isConfigured,
+    isConfiguredAsync: async (ctx) => isConfigured(ctx),
+    synthesize: async (req) => {
+      const params = await resolveOpenAITtsRequest(req);
+      const audioBuffer = await openaiTTS(params);
+      const fileExtension = `.${params.responseFormat}`;
+      const { isVoiceMessageCompatibleAudio } = await import("openclaw/plugin-sdk/media-runtime");
+      return {
+        audioBuffer,
+        outputFormat: params.responseFormat,
+        fileExtension,
+        voiceCompatible:
+          req.target === "voice-note" &&
+          isVoiceMessageCompatibleAudio({ fileName: `speech${fileExtension}` }),
+      };
+    },
+    synthesizeTelephony: async (req) => {
+      const params = await resolveOpenAITtsRequest({ ...req, target: "telephony" }, "pcm");
+      const audioBuffer = await openaiTTS(params);
+      return { audioBuffer, outputFormat: "pcm", sampleRate: 24_000 };
+    },
+  };
+}

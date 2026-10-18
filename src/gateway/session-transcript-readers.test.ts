@@ -1,0 +1,592 @@
+import fs from "node:fs";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import { persistSessionTranscriptTurn } from "../config/sessions/session-accessor.js";
+import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
+import { SessionTranscriptProjectionUnavailableError } from "../config/sessions/session-transcript-projection-error.js";
+import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
+import {
+  createOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
+import { visitSessionMessagesAsync } from "./session-transcript-native.test-support.js";
+import {
+  readRecentSessionMessagesWithStatsAsync,
+  readSessionMessageByIdAsync,
+  readSessionMessageCountAsync,
+  readSessionTranscriptAccountingAsync,
+  readSessionMessagesAsync,
+  readSessionMessagesAroundIdWithStatsAsync,
+  readSessionMessagesPageWithStatsAsync,
+  readSessionMessagesWithSourceAsync,
+} from "./session-transcript-readers.js";
+import { readLatestSessionUsageFromTranscriptAsync } from "./session-transcript-usage.js";
+
+describe("session transcript reader facade", () => {
+  let tempDir: string;
+  let storePath: string;
+  let state: OpenClawTestState;
+
+  beforeEach(async () => {
+    state = await createOpenClawTestState({
+      prefix: "openclaw-transcript-readers-",
+      layout: "state-only",
+    });
+    setRuntimeConfigSnapshot({});
+    tempDir = state.stateDir;
+    storePath = path.join(tempDir, "sessions.json");
+  });
+
+  afterEach(async () => {
+    await state.cleanup();
+    clearRuntimeConfigSnapshot();
+  });
+
+  async function writeTranscript(sessionId: string, events: unknown[]) {
+    const scope = {
+      agentId: "main",
+      sessionId,
+      sessionKey: `agent:main:${sessionId}`,
+      storePath,
+    };
+    await replaceTranscriptEvents(scope, events);
+    return scope;
+  }
+
+  function markProjectionNeedsRebuild(sessionId: string): void {
+    openOpenClawAgentDatabase({
+      agentId: "main",
+      path: path.join(tempDir, "openclaw-agent.sqlite"),
+    })
+      .db.prepare(
+        "UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?",
+      )
+      .run(sessionId);
+  }
+
+  test("prepares byte, usage and taint facts without host transcript SQL", async () => {
+    const events = [
+      { type: "session", id: "accounting", version: 3 },
+      {
+        type: "message",
+        id: "user",
+        parentId: null,
+        message: { role: "user", content: "question" },
+      },
+      {
+        type: "message",
+        id: "answer",
+        parentId: "user",
+        message: {
+          role: "assistant",
+          content: "answer",
+          usage: { input: 200, output: 7 },
+          __openclaw: { turnTainted: true },
+        },
+      },
+    ];
+    const scope = await writeTranscript("accounting", events);
+    const options = { includeByteSize: true, includeUsage: true, includeTurnTaint: true };
+    await readSessionTranscriptAccountingAsync(scope, options);
+    const hostSql = observeHostDataSql();
+    const result = await readSessionTranscriptAccountingAsync(scope, options).finally(() =>
+      hostSql.restore(),
+    );
+    expect(hostSql.queries).toEqual([]);
+    expect(result).toEqual({
+      byteSize: events
+        .slice(1)
+        .reduce((bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1, 0),
+      eventCount: 2,
+      turnTainted: true,
+      usage: { promptTokens: 200, outputTokens: 7, trailingMessages: [] },
+    });
+  });
+
+  test("sizes CLI output from the context marker when counters cover the whole turn", async () => {
+    const scope = await writeTranscript("cli-turn-usage", [
+      { type: "session", id: "cli-turn-usage", version: 3 },
+      {
+        type: "message",
+        id: "answer",
+        parentId: null,
+        message: {
+          role: "assistant",
+          api: "cli",
+          content: "multi-call turn",
+          // Counters sum every model call in the turn; contextUsage is the latest call.
+          usage: {
+            input: 135_864,
+            output: 30_000,
+            cacheRead: 37_888,
+            totalTokens: 203_752,
+            contextUsage: { state: "available", promptTokens: 86_876, totalTokens: 88_876 },
+          },
+        },
+      },
+    ]);
+
+    const result = await readSessionTranscriptAccountingAsync(scope, {
+      includeByteSize: false,
+      includeUsage: true,
+    });
+
+    expect(result.usage).toEqual({
+      promptTokens: 86_876,
+      outputTokens: 2_000,
+      trailingMessages: [],
+    });
+  });
+
+  test("reads active-branch messages and message ids through a scope", async () => {
+    const scope = await writeTranscript("reader-active-branch", [
+      { type: "session", version: 3, id: "reader-active-branch" },
+      {
+        type: "message",
+        id: "root",
+        parentId: null,
+        timestamp: "0",
+        message: { role: "user", content: "root prompt" },
+      },
+      {
+        type: "message",
+        id: "inactive",
+        parentId: "root",
+        message: { role: "assistant", content: "stale answer" },
+      },
+      {
+        type: "message",
+        id: "active",
+        parentId: "root",
+        timestamp: "2026",
+        message: {
+          role: "assistant",
+          content: "active answer",
+          idempotencyKey: "active:assistant",
+        },
+      },
+    ]);
+
+    await expect(
+      readSessionMessagesAsync(scope, { mode: "full", reason: "facade active branch test" }),
+    ).resolves.toMatchObject([
+      {
+        content: "root prompt",
+        __openclaw: { id: "root", seq: 1, recordTimestampMs: Date.parse("0") },
+      },
+      {
+        content: "active answer",
+        idempotencyKey: "active:assistant",
+        __openclaw: {
+          id: "active",
+          seq: 2,
+          recordTimestampMs: Date.parse("2026"),
+          idempotencyKey: "active:assistant",
+        },
+      },
+    ]);
+    const visited: Array<{ message: unknown; seq: number }> = [];
+    await expect(
+      visitSessionMessagesAsync(scope, (message, seq) => visited.push({ message, seq })),
+    ).resolves.toBe(2);
+    expect(visited).toEqual([
+      { message: { role: "user", content: "root prompt" }, seq: 1 },
+      {
+        message: {
+          role: "assistant",
+          content: "active answer",
+          idempotencyKey: "active:assistant",
+        },
+        seq: 2,
+      },
+    ]);
+    await expect(readSessionMessageCountAsync(scope)).resolves.toBe(2);
+    await expect(readSessionMessageByIdAsync(scope, "active")).resolves.toMatchObject({
+      found: true,
+      oversized: false,
+      seq: 2,
+    });
+    await expect(
+      readSessionMessagesAroundIdWithStatsAsync(scope, {
+        messageId: "active",
+        maxMessages: 1,
+      }),
+    ).resolves.toMatchObject({
+      found: true,
+      hasOverreadContext: true,
+      messages: [{ content: "root prompt" }, { content: "active answer" }],
+      offset: 0,
+      totalMessages: 2,
+    });
+  });
+
+  test("bounds source pages and freezes their sequence across appends", async () => {
+    const sessionId = "reader-source-pages";
+    const scope = await writeTranscript(sessionId, [
+      { type: "session", version: 3, id: sessionId },
+      ...Array.from({ length: 260 }, (_, index) => ({
+        type: "message",
+        id: `message-${index}`,
+        parentId: index === 0 ? null : `message-${index - 1}`,
+        message: { role: "user", content: `prompt ${index}` },
+      })),
+    ]);
+    let page = await readSessionMessagesWithSourceAsync(scope, { mode: "page" });
+    expect(page.messages).toHaveLength(128);
+    expect(page.nextCursor).toBeDefined();
+    expect(page.snapshot).toMatchObject({ totalMessages: 260 });
+    const firstCursor = page.nextCursor;
+    const snapshot = page.snapshot;
+    const messages = [...page.messages];
+
+    await persistSessionTranscriptTurn(scope, {
+      messages: [
+        {
+          eventId: "appended",
+          parentId: "message-259",
+          message: { role: "assistant", content: "appended after the first page" },
+        },
+      ],
+      touchSessionEntry: false,
+    });
+    expect(await readSessionMessageCountAsync(scope)).toBe(261);
+    while (page.nextCursor) {
+      page = await readSessionMessagesWithSourceAsync(scope, {
+        mode: "page",
+        cursor: page.nextCursor,
+      });
+      expect(page.messages.length).toBeLessThanOrEqual(128);
+      expect(page.snapshot).toEqual(snapshot);
+      messages.push(...page.messages);
+    }
+    expect(
+      messages.map((message) => (message as { __openclaw: { id: string } })["__openclaw"].id),
+    ).toEqual(Array.from({ length: 260 }, (_, index) => `message-${index}`));
+
+    await replaceTranscriptEvents(scope, [
+      { type: "session", version: 3, id: sessionId },
+      {
+        type: "message",
+        id: "replacement",
+        parentId: null,
+        message: { role: "user", content: "new transcript" },
+      },
+    ]);
+    await expect(
+      readSessionMessagesWithSourceAsync(scope, { mode: "page", cursor: firstCursor }),
+    ).rejects.toMatchObject({
+      name: "SessionTranscriptProjectionUnavailableError",
+      reason: "window-changed",
+    });
+  });
+
+  test("bounds source pages by bytes and rejects a message larger than one page", async () => {
+    const sessionId = "reader-source-page-bytes";
+    const content = "a".repeat(3 * 1024 * 1024);
+    const scope = await writeTranscript(sessionId, [
+      { type: "session", version: 3, id: sessionId },
+      ...Array.from({ length: 3 }, (_, index) => ({
+        type: "message",
+        id: `large-${index}`,
+        parentId: index === 0 ? null : `large-${index - 1}`,
+        message: { role: "user", content },
+      })),
+    ]);
+    expect(await readSessionMessageCountAsync(scope)).toBe(3);
+    const first = await readSessionMessagesWithSourceAsync(scope, { mode: "page" });
+    expect(first.messages).toHaveLength(2);
+    expect(first.nextCursor).toBeDefined();
+    const last = await readSessionMessagesWithSourceAsync(scope, {
+      mode: "page",
+      cursor: first.nextCursor,
+    });
+    expect(last.messages).toHaveLength(1);
+    expect(last.nextCursor).toBeUndefined();
+    for (const page of [first, last]) {
+      expect(Buffer.byteLength(JSON.stringify(page.messages))).toBeLessThan(8 * 1024 * 1024);
+      for (const message of page.messages) {
+        expect((message as { content: string }).content).toBe(content);
+      }
+    }
+
+    await replaceTranscriptEvents(scope, [
+      { type: "session", version: 3, id: sessionId },
+      {
+        type: "message",
+        id: "oversized",
+        parentId: null,
+        message: { role: "user", content: "b".repeat(8 * 1024 * 1024) },
+      },
+    ]);
+    expect(await readSessionMessageCountAsync(scope)).toBe(1);
+    await expect(readSessionMessagesWithSourceAsync(scope, { mode: "page" })).rejects.toThrow(
+      "Transcript source message exceeds the 8388608-byte page limit",
+    );
+    await expect(
+      readSessionMessagesPageWithStatsAsync(scope, { offset: 0, maxMessages: 1 }),
+    ).rejects.toThrow("Transcript history message exceeds the 8388608-byte page limit");
+    await expect(
+      readRecentSessionMessagesWithStatsAsync(scope, { maxMessages: 1 }),
+    ).rejects.toThrow("Transcript history message exceeds the 8388608-byte page limit");
+    await expect(
+      readSessionMessagesAroundIdWithStatsAsync(scope, { messageId: "oversized", maxMessages: 1 }),
+    ).rejects.toThrow("Transcript history message exceeds the 8388608-byte page limit");
+    openOpenClawAgentDatabase({
+      agentId: "main",
+      path: path.join(tempDir, "openclaw-agent.sqlite"),
+    })
+      .db.prepare("DELETE FROM transcript_event_identities WHERE session_id = ?")
+      .run(sessionId);
+    await expect(readSessionMessageByIdAsync(scope, "oversized")).resolves.toMatchObject({
+      found: true,
+    });
+    await expect(
+      readSessionMessagesAroundIdWithStatsAsync(scope, { messageId: "oversized", maxMessages: 1 }),
+    ).rejects.toThrow("Transcript history message exceeds the 8388608-byte page limit");
+  });
+
+  test("refuses unbounded anchor windows and caps payloads before decoding", async () => {
+    const sessionId = "reader-anchor-page-bytes";
+    const scope = await writeTranscript(sessionId, [
+      { type: "session", version: 3, id: sessionId },
+      ...Array.from({ length: 3 }, (_, index) => ({
+        type: "message",
+        id: `large-${index}`,
+        parentId: index === 0 ? null : `large-${index - 1}`,
+        message: { role: "user", content: "a".repeat(3 * 1024 * 1024) },
+      })),
+    ]);
+    await expect(
+      readSessionMessagesAroundIdWithStatsAsync(scope, { messageId: "large-1", maxMessages: 3 }),
+    ).rejects.toThrow(
+      "Transcript history page exceeds the 8388608-byte limit; request a smaller limit",
+    );
+    const database = openOpenClawAgentDatabase({
+      agentId: "main",
+      path: path.join(tempDir, "openclaw-agent.sqlite"),
+    });
+    // Preserve recorded sizes while poisoning excluded payloads: a late cap would parse this.
+    database.db
+      .prepare(
+        "UPDATE transcript_events SET event_json = '{malformed', event_zstd = NULL WHERE session_id = ? AND seq = 1",
+      )
+      .run(sessionId);
+    const page = await readSessionMessagesAroundIdWithStatsAsync(scope, {
+      messageId: "large-1",
+      maxMessages: 3,
+      maxBytes: 4 * 1024 * 1024,
+    });
+    expect(page.messages).toMatchObject([{ __openclaw: { id: "large-2" } }]);
+    expect(page.hasOverreadContext).toBe(false);
+  });
+
+  test.each(["visitor"] as const)(
+    "acquires messages incrementally and releases the cursor after %s failure",
+    async (failure) => {
+      const sessionId = `reader-stream-${failure}`;
+      const scope = await writeTranscript(sessionId, [
+        { type: "session", version: 3, id: sessionId },
+        {
+          type: "message",
+          id: "first",
+          parentId: null,
+          message: { role: "user", content: "first prompt" },
+        },
+        {
+          type: "message",
+          id: "later",
+          parentId: "first",
+          message: { role: "assistant", content: "later answer" },
+        },
+      ]);
+      const database = openOpenClawAgentDatabase({
+        agentId: "main",
+        path: path.join(tempDir, "openclaw-agent.sqlite"),
+      });
+      // Keep the ready projection, but poison a later payload: an early abort must never parse it.
+      database.db
+        .prepare(
+          `UPDATE transcript_events SET event_json = '{malformed'
+           WHERE session_id = ? AND seq = (
+             SELECT MAX(seq) FROM transcript_events WHERE session_id = ?
+           )`,
+        )
+        .run(sessionId, sessionId);
+      const stopped = new Error("visitor stopped");
+      const visited: Array<{ message: unknown; seq: number }> = [];
+      const traversal = visitSessionMessagesAsync(scope, (message, seq) => {
+        expect(database.db.isTransaction).toBe(true);
+        visited.push({ message, seq });
+        if (failure === "visitor") {
+          throw stopped;
+        }
+      });
+      if (failure === "visitor") {
+        await expect(traversal).rejects.toBe(stopped);
+      } else {
+        await expect(traversal).rejects.toBeInstanceOf(SyntaxError);
+      }
+      expect(visited).toEqual([{ message: { role: "user", content: "first prompt" }, seq: 1 }]);
+      expect(database.db.isTransaction).toBe(false);
+      // A surviving read cursor prevents checkpointing even after transaction rollback.
+      expect(database.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()).toMatchObject({
+        busy: 0,
+      });
+    },
+  );
+
+  test("keeps SQLite precedence by ignoring an obsolete active JSONL during archive fallback", async () => {
+    const sessionId = "reader-reset-archive-only";
+    const scope = {
+      agentId: "main",
+      sessionId,
+      sessionKey: `agent:main:${sessionId}`,
+      storePath,
+    };
+    const line = (content: string) =>
+      `${JSON.stringify({ type: "session", version: 1, id: sessionId })}\n${JSON.stringify({
+        message: { role: "assistant", content },
+      })}\n`;
+    fs.writeFileSync(path.join(tempDir, `${sessionId}.jsonl`), line("obsolete live file"));
+    fs.writeFileSync(
+      path.join(tempDir, `${sessionId}.jsonl.reset.2026-07-12T18-00-00.000Z`),
+      line("retained archive"),
+    );
+
+    for (const allowResetArchiveFallback of [false, undefined]) {
+      await expect(
+        readSessionMessagesPageWithStatsAsync(scope, {
+          offset: 0,
+          maxMessages: 1,
+          allowResetArchiveFallback,
+        }),
+      ).rejects.toMatchObject({
+        name: "SessionTranscriptStorageUnavailableError",
+        reason: "database-missing",
+      });
+    }
+
+    await expect(
+      readSessionMessagesAsync(scope, {
+        mode: "full",
+        reason: "archive-only fallback test",
+        allowResetArchiveFallback: true,
+      }),
+    ).resolves.toMatchObject([{ content: "retained archive" }]);
+    await expect(
+      readRecentSessionMessagesWithStatsAsync(scope, {
+        maxMessages: 1,
+        allowResetArchiveFallback: true,
+      }),
+    ).resolves.toMatchObject({ messages: [{ content: "retained archive" }] });
+    await expect(
+      readSessionMessagesPageWithStatsAsync(scope, {
+        offset: 0,
+        maxMessages: 1,
+        allowResetArchiveFallback: true,
+      }),
+    ).resolves.toMatchObject({ messages: [{ content: "retained archive" }] });
+  });
+
+  test("uses an explicit JSONL artifact when the store path is a placeholder", async () => {
+    const sessionId = "reader-artifact-placeholder-store";
+    const transcriptPath = path.join(tempDir, `${sessionId}.jsonl`);
+    fs.writeFileSync(
+      transcriptPath,
+      `${JSON.stringify({ type: "session", version: 1, id: sessionId })}\n${JSON.stringify({
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          usage: { input: 12, output: 3, cost: { total: 0.001 } },
+        },
+      })}\n`,
+      "utf-8",
+    );
+
+    await expect(
+      readLatestSessionUsageFromTranscriptAsync({
+        agentId: "main",
+        sessionId,
+        sessionKey: `agent:main:${sessionId}`,
+        sessionFile: transcriptPath,
+        storePath: "(multiple)",
+      }),
+    ).resolves.toMatchObject({
+      inputTokens: 12,
+      outputTokens: 3,
+    });
+  });
+
+  test("keeps a canonical session key on SQLite when the store path is a placeholder", async () => {
+    const sessionId = "reader-placeholder-sqlite-key";
+    const sessionKey = `agent:main:${sessionId}`;
+    const defaultStorePath = path.join(tempDir, "agents", "main", "sessions", "sessions.json");
+    await persistSessionTranscriptTurn(
+      { agentId: "main", sessionId, sessionKey, storePath: defaultStorePath },
+      {
+        messages: [
+          {
+            message: {
+              role: "assistant",
+              provider: "anthropic",
+              model: "claude-sonnet-4-6",
+              usage: { input: 15, output: 4, cost: { total: 0.001 } },
+            },
+          },
+        ],
+        updateMode: "file-only",
+      },
+    );
+
+    await expect(
+      readLatestSessionUsageFromTranscriptAsync({
+        sessionId,
+        sessionKey,
+        sessionFile: sessionKey,
+        storePath: "(multiple)",
+      }),
+    ).resolves.toMatchObject({
+      inputTokens: 15,
+      outputTokens: 4,
+    });
+  });
+
+  test("waits for an in-flight SQLite projection before counting messages", async () => {
+    const sessionId = "reader-sqlite-rebuilding-count";
+    const scope = {
+      agentId: "main",
+      sessionId,
+      sessionKey: `agent:main:${sessionId}`,
+      storePath,
+    };
+    await persistSessionTranscriptTurn(scope, {
+      messages: [
+        {
+          eventId: "root",
+          parentId: null,
+          message: { role: "user", content: "cross-client prompt" },
+        },
+        {
+          eventId: "reply",
+          parentId: "root",
+          message: { role: "assistant", content: "cross-client reply" },
+        },
+      ],
+      touchSessionEntry: false,
+    });
+    markProjectionNeedsRebuild(sessionId);
+
+    const visited: unknown[] = [];
+    await expect(
+      visitSessionMessagesAsync(scope, (message) => visited.push(message)),
+    ).rejects.toBeInstanceOf(SessionTranscriptProjectionUnavailableError);
+    expect(visited).toEqual([]);
+    await expect(readSessionMessageCountAsync(scope)).resolves.toBe(2);
+  });
+});

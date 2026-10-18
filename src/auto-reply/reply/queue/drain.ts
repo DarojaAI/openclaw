@@ -1,0 +1,370 @@
+import { createHash } from "node:crypto";
+import { runAgentHarnessBeforeMessageWriteHook } from "../../../agents/harness/hook-helpers.js";
+import { runOutsidePreparedModelRuntimePluginGenerationScope } from "../../../agents/prepared-model-runtime-generation-scope.js";
+import { normalizeChatType } from "../../../channels/chat-type.js";
+import { channelRouteDedupeKey } from "../../../plugin-sdk/channel-route.js";
+import {
+  getGatewayRestartDrainSignal,
+  isGatewayRestartDrainError,
+  isGatewayRestartDraining,
+  runWithGatewayDetachedWorkContinuation,
+} from "../../../process/gateway-work-admission.js";
+import { defaultRuntime } from "../../../runtime.js";
+import { deferSessionControllerClaimBeforeExecution } from "../../../sessions/session-controller.mailbox-claim.js";
+import {
+  detachSessionControllerSources,
+  getExistingSessionControllerMailbox,
+  releaseSessionControllerClaim,
+  trackSessionControllerSourceWork,
+  type SessionControllerMailbox,
+  type SessionControllerMailboxClaim,
+} from "../../../sessions/session-controller.mailbox.js";
+import type { SessionControllerEntry } from "../../../sessions/session-controller.state.js";
+import { createUserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.js";
+import { AgentDatabaseExecutionAdmissionClosedError } from "../../../state/agent-database-admission-error.js";
+import { buildCollectPrompt, previewQueueSummaryPrompt } from "../../../utils/queue-helpers.js";
+import { resolveCollectedRun } from "./collected-run.js";
+import { collectRuntimeMetadata, resolveFollowupReplyAnchor } from "./delivery-context.js";
+import {
+  buildCollectTranscriptInput,
+  collectQueuedPromptMedia,
+  createAggregateCancellation,
+  createCollectUserTurnTranscriptRecorder,
+  renderCollectItem,
+  resolveAggregateOwner,
+  resolveFollowupTranscriptTarget,
+  resolveOriginRoutingMetadata,
+} from "./envelope.js";
+import {
+  admitFollowupRunLifecycle,
+  completeFollowupRunLifecycle,
+  retireFollowupRunCancellation,
+  updateFollowupRetryHeartbeats,
+} from "./lifecycle.js";
+import { followupQueueSources } from "./state.js";
+import { consumeQueueSummaryDelivery } from "./summary-consumption.js";
+import { isFollowupRunAborted, type FollowupRun } from "./types.js";
+
+// Overflow retries must reuse one transcript identity, while the same provider-local
+// message ID on a different channel route remains an independent user turn.
+function buildOverflowTranscriptIdempotencyKey(source: FollowupRun, prompt: string): string {
+  const promptHash = createHash("sha256").update(prompt).digest("hex");
+  const routeHash = createHash("sha256")
+    .update(
+      JSON.stringify([
+        channelRouteDedupeKey({
+          channel: source.originatingChannel,
+          to: source.originatingTo,
+          accountId: source.originatingAccountId,
+          threadId: source.originatingThreadId,
+        }),
+        resolveFollowupReplyAnchor(source) ?? "",
+        source.originatingReplyToMode ?? "",
+        normalizeChatType(source.originatingChatType) ?? "",
+      ]),
+    )
+    .digest("hex");
+  return `followup-overflow:${source.run.sessionId}:${routeHash}:${source.messageId ?? source.enqueuedAt}:${promptHash}`;
+}
+
+/** Executes an already-selected claim. This adapter never chooses a successor. */
+async function executeClaim(
+  claim: SessionControllerMailboxClaim,
+  execute: (run: FollowupRun) => Promise<void>,
+): Promise<void> {
+  const queue = claim.mailbox;
+  const generation = queue.abortController;
+  const sources = [...claim.sources];
+  const source = sources.at(-1);
+  if (!source) {
+    releaseSessionControllerClaim(claim);
+    return;
+  }
+  const cancellation = createAggregateCancellation(sources);
+  const aggregateOwner = resolveAggregateOwner(sources);
+  const adopt = async () => {
+    // Accepted collection consumes every source even when an ingress ack fails.
+    detachSessionControllerSources(sources);
+    const admissions = sources.map((item) => admitFollowupRunLifecycle(item));
+    try {
+      await Promise.all(admissions);
+    } catch (error) {
+      // Retry eligibility depends on every source's final adoption outcome.
+      await Promise.allSettled(admissions);
+      throw error;
+    }
+    cancellation.admit();
+    for (const item of sources) {
+      if (item !== aggregateOwner) {
+        retireFollowupRunCancellation(item);
+      }
+    }
+  };
+  for (const item of sources) {
+    if (claim.summary) {
+      queue.activeSummarySources.add(item);
+    }
+  }
+  const summaryLines = sources.map((item) => {
+    const index = queue.summarySources.indexOf(item);
+    if (index >= 0) {
+      return queue.summaryLines[index] ?? "";
+    }
+    for (const elision of queue.summaryElisions) {
+      const elisionIndex = elision.sources.indexOf(item);
+      if (elisionIndex >= 0) {
+        return elision.summaryLines[elisionIndex] ?? "";
+      }
+    }
+    return item.summaryLine ?? item.prompt;
+  });
+  const prompt = claim.summary
+    ? (previewQueueSummaryPrompt({
+        state: {
+          droppedCount: sources.length,
+          summaryLines: queue.cap > 0 ? summaryLines.slice(-queue.cap) : summaryLines,
+        },
+        noun: "message",
+      }) ?? "")
+    : buildCollectPrompt({
+        title: "[Queued messages while agent was busy]",
+        items: sources,
+        renderItem: renderCollectItem,
+      });
+  const settleSources = async (outcome?: "consumed") => {
+    for (const item of sources) {
+      completeFollowupRunLifecycle(item, outcome);
+    }
+    await Promise.all(sources.flatMap((item) => item.controllerInput?.custody.settling ?? []));
+  };
+  let run = source;
+  if (claim.summary || sources.length > 1) {
+    const recorder = claim.summary
+      ? createUserTurnTranscriptRecorder({
+          input: {
+            text: prompt,
+            idempotencyKey: buildOverflowTranscriptIdempotencyKey(source, prompt),
+            senderIsOwner: source.run.senderIsOwner,
+            provenance: source.run.inputProvenance,
+          },
+          pendingInputSources: sources.flatMap((item) => item.userTurnTranscriptRecorder ?? []),
+          target: () => resolveFollowupTranscriptTarget(source),
+          beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
+          errorContext: "mailbox overflow transcript",
+        })
+      : createCollectUserTurnTranscriptRecorder(sources);
+    run = {
+      ...source,
+      ...resolveOriginRoutingMetadata(sources),
+      ...collectRuntimeMetadata(sources, cancellation.signal),
+      ...collectQueuedPromptMedia(sources),
+      ...(claim.summary ? { currentInboundContext: undefined } : {}),
+      prompt,
+      transcriptPrompt: claim.summary ? prompt : buildCollectTranscriptInput(sources).text,
+      userTurnTranscriptRecorder: recorder,
+      run: resolveCollectedRun(sources, source.run),
+      controllerInput: source.controllerInput,
+      controllerClaim: claim,
+      turnAdoptionLifecycle: {
+        admission: "cancel-only",
+        cronCreatorAuthorityUnavailable: sources.find(
+          (item) => item.turnAdoptionLifecycle?.cronCreatorAuthorityUnavailable,
+        )?.turnAdoptionLifecycle?.cronCreatorAuthorityUnavailable,
+        onAdopted: adopt,
+        onAbandoned: () => settleSources(),
+        onSettled: () => settleSources("consumed"),
+      },
+    };
+  }
+  let adoptionRefused = false;
+  let waitForFreshKick = false;
+  try {
+    await execute(run);
+  } catch (error) {
+    updateFollowupRetryHeartbeats(error, sources);
+    adoptionRefused = sources.some((item) => {
+      const custody = item.controllerInput?.custody;
+      return (
+        custody && !custody.adopted && custody.failure !== undefined && custody.failure === error
+      );
+    });
+    if (adoptionRefused) {
+      // Adoption is the last reversible producer boundary before model/tool work.
+      // Match the custody owner's exact rejection so later execution errors cannot replay.
+      deferSessionControllerClaimBeforeExecution(claim);
+    }
+    waitForFreshKick =
+      claim.retryBeforeExecution === true &&
+      error instanceof AgentDatabaseExecutionAdmissionClosedError;
+    defaultRuntime.error?.("mailbox execution failed for " + queue.key + ": " + String(error));
+  } finally {
+    // Only the execution producer can return an explicit pre-execution refusal.
+    // Generic throws/returns and the operation's broader preparation marker never
+    // grant or revoke replayability; the producer-local receipt is authoritative.
+    const preparationRefused = claim.retryBeforeExecution === true;
+    const retrySources = claim.retryBeforeExecution
+      ? sources.filter((item) => {
+          try {
+            item.operatorAuthority?.assertCurrent();
+          } catch {
+            return false;
+          }
+          return (
+            !isFollowupRunAborted(item) &&
+            !item.controllerInput?.retirementRequested &&
+            (!adoptionRefused || !item.controllerInput?.custody.adopted) &&
+            !item.controllerInput?.custody.completed
+          );
+        })
+      : [];
+    if (!retrySources.length) {
+      claim.retryBeforeExecution = false;
+    }
+    const consumed = sources.filter((item) => !retrySources.includes(item));
+    detachSessionControllerSources(consumed);
+    if (claim.summary) {
+      consumeQueueSummaryDelivery(
+        queue,
+        { sources: consumed, droppedCount: consumed.length },
+        false,
+      );
+    }
+    for (const item of retrySources) {
+      item.controllerInput!.payload = claim.summary ? "summary" : "ready";
+    }
+    if (retrySources.length) {
+      queue.lastEnqueuedAt = Date.now();
+    }
+    for (const item of sources) {
+      queue.activeSummarySources.delete(item);
+      for (const elision of queue.summaryElisions) {
+        const compact = elision.sourceRefs.get(item);
+        if (compact) {
+          queue.activeSummarySources.delete(compact);
+        }
+      }
+      if (retrySources.includes(item)) {
+        continue;
+      }
+      try {
+        completeFollowupRunLifecycle(item, preparationRefused ? undefined : "consumed");
+      } catch (error) {
+        defaultRuntime.error?.("mailbox custody settlement failed: " + String(error));
+      }
+    }
+    cancellation.dispose();
+    if (!waitForFreshKick && queue.abortController === generation) {
+      queue.dispatchEnabled = true;
+    }
+    releaseSessionControllerClaim(claim);
+  }
+}
+export function rememberFollowupDrainCallback(
+  key: string,
+  runFollowup: (run: FollowupRun) => Promise<void>,
+  captured?: SessionControllerMailbox,
+): void {
+  const mailbox = captured ?? getExistingSessionControllerMailbox(key);
+  if (!mailbox) {
+    return;
+  }
+  mailbox.dispatch = async (claim) => {
+    if (isGatewayRestartDraining() && deferSessionControllerClaimBeforeExecution(claim)) {
+      mailbox.dispatchEnabled = false;
+      releaseSessionControllerClaim(claim);
+      return;
+    }
+    let entered = false;
+    try {
+      // The turn owns a fresh async work scope: tracked agent work must keep running
+      // after the request that triggered the drain has closed its own scope.
+      await runWithGatewayDetachedWorkContinuation(
+        () =>
+          runOutsidePreparedModelRuntimePluginGenerationScope(() => {
+            entered = true;
+            // Consume this request; a kick during execution re-enables dispatch.
+            mailbox.dispatchEnabled = false;
+            return executeClaim(claim, runFollowup);
+          }),
+        "session:mailbox-turn",
+      );
+    } catch (error) {
+      if (
+        !entered &&
+        isGatewayRestartDrainError(error) &&
+        !getGatewayRestartDrainSignal().aborted &&
+        deferSessionControllerClaimBeforeExecution(claim)
+      ) {
+        // Rollback alone must not create a background backlog. The next ordinary
+        // kick re-enables dispatch of the retained, unexecuted input.
+        mailbox.dispatchEnabled = false;
+        releaseSessionControllerClaim(claim);
+        return;
+      }
+      defaultRuntime.error?.("mailbox root admission failed: " + String(error));
+      for (const source of claim.sources) {
+        completeFollowupRunLifecycle(source);
+      }
+      detachSessionControllerSources(claim.sources);
+      if (claim.summary) {
+        consumeQueueSummaryDelivery(
+          mailbox,
+          { sources: claim.sources, droppedCount: claim.sources.length },
+          false,
+        );
+      }
+      releaseSessionControllerClaim(claim);
+    }
+  };
+}
+
+export function scheduleFollowupDrain(
+  key: string,
+  runFollowup: (run: FollowupRun) => Promise<void>,
+  owner?: SessionControllerEntry,
+): void {
+  const mailbox = owner ? owner.mailbox : getExistingSessionControllerMailbox(key);
+  if (!mailbox) {
+    return;
+  }
+  rememberFollowupDrainCallback(key, runFollowup, mailbox);
+  mailbox.dispatchEnabled = true;
+  mailbox.wake();
+}
+
+/** Wake the existing controller dispatcher without acquiring another execution owner. */
+export function kickFollowupDrainIfIdle(key: string, owner?: SessionControllerEntry): void {
+  const mailbox = owner ? owner.mailbox : getExistingSessionControllerMailbox(key);
+  if (mailbox?.dispatch) {
+    mailbox.dispatchEnabled = true;
+    mailbox.wake();
+  }
+}
+
+export async function dropAbortedFollowups(
+  queue: SessionControllerMailbox,
+  runFollowup: (run: FollowupRun) => Promise<void>,
+): Promise<number> {
+  const sources = [...new Set(followupQueueSources(queue))].filter(
+    (source) =>
+      isFollowupRunAborted(source) &&
+      source.controllerInput?.phase !== "injecting" &&
+      !queue.inFlight.has(source),
+  );
+  detachSessionControllerSources(sources);
+  consumeQueueSummaryDelivery(queue, { sources, droppedCount: 0 }, false);
+  for (const source of sources) {
+    const presentation = Promise.resolve().then(() => runFollowup(source));
+    if (source.controllerInput) {
+      trackSessionControllerSourceWork(source.controllerInput, presentation);
+    }
+    completeFollowupRunLifecycle(source);
+    try {
+      await presentation;
+    } catch (error) {
+      defaultRuntime.error?.("mailbox cancellation presentation failed: " + String(error));
+    }
+  }
+  queue.wake();
+  return sources.length;
+}

@@ -1,0 +1,79 @@
+import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
+import { applyModelCompatPatch } from "openclaw/plugin-sdk/provider-model-shared";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { VENICE_BASE_URL, VENICE_MODEL_DISCOVERY_OPTIONS } from "./models.js";
+import { applyVeniceConfig } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
+import { buildStaticVeniceProvider } from "./provider-catalog.js";
+import { createVeniceStreamWrapper } from "./stream.js";
+import { fetchVeniceUsage } from "./usage.js";
+
+const PROVIDER_ID = "venice";
+const XAI_UNSUPPORTED_SCHEMA_KEYWORDS = [
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "minContains",
+  "maxContains",
+] as const;
+
+function isXaiBackedVeniceModel(modelId: string): boolean {
+  return normalizeLowercaseStringOrEmpty(modelId).includes("grok");
+}
+
+export default defineSingleProviderPluginEntry({
+  id: PROVIDER_ID,
+  name: "Venice Provider",
+  description: "Bundled Venice provider plugin",
+  manifest,
+  provider: {
+    label: "Venice",
+    docsPath: "/providers/venice",
+    manifestAuth: {
+      applyConfig: applyVeniceConfig,
+      noteMessage: [
+        "Venice AI provides privacy-focused inference with uncensored models.",
+        "Get your API key at: https://venice.ai/settings/api",
+        "Supports 'private' (fully private) and 'anonymized' (proxy) modes.",
+      ].join("\n"),
+      noteTitle: "Venice AI",
+    },
+    catalog: {
+      discoveryMode: "strict",
+      buildProvider: buildStaticVeniceProvider,
+      liveModelDiscovery: VENICE_MODEL_DISCOVERY_OPTIONS,
+    },
+    normalizeResolvedModel: ({ modelId, model }) => {
+      const normalized = isXaiBackedVeniceModel(modelId)
+        ? applyModelCompatPatch(model, {
+            toolSchemaProfile: "xai",
+            unsupportedToolSchemaKeywords: [...XAI_UNSUPPORTED_SCHEMA_KEYWORDS],
+            toolCallArgumentsEncoding: "html-entities",
+          })
+        : model;
+      return model.api === "openai-completions" &&
+        model.baseUrl?.trim().replace(/\/+$/u, "") === VENICE_BASE_URL
+        ? applyModelCompatPatch(normalized, {
+            supportsPromptCacheKey: model.compat?.supportsPromptCacheKey ?? true,
+            supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? false,
+          })
+        : normalized;
+    },
+    wrapStreamFn: (ctx) => createVeniceStreamWrapper(ctx.streamFn),
+    resolveUsageAuth: async (ctx) => {
+      const apiKey = (
+        await ctx.resolveApiKeyCandidatesFromConfigAndStore?.({
+          envDirect: [ctx.env.VENICE_API_KEY],
+        })
+      )?.[0];
+      return apiKey ? { token: apiKey } : null;
+    },
+    fetchUsageSnapshot: async (ctx) =>
+      await fetchVeniceUsage({
+        token: ctx.token,
+        timeoutMs: ctx.timeoutMs,
+        fetchFn: ctx.fetchFn,
+      }),
+  },
+});

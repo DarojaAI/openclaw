@@ -1,0 +1,186 @@
+// @vitest-environment node
+import { describe, expect, it } from "vitest";
+import {
+  matchesNodeSearch,
+  parseConfigSearchQuery,
+  resolveConfigMapSearch,
+} from "./config-form.search.ts";
+
+const schema = {
+  type: "object",
+  properties: {
+    gateway: {
+      type: "object",
+      properties: {
+        auth: {
+          type: "object",
+          properties: {
+            token: { type: "string" },
+          },
+        },
+      },
+    },
+    mode: {
+      type: "string",
+      enum: ["off", "token"],
+    },
+  },
+};
+
+describe("config form search", () => {
+  it("matches fields by tag through ui hints", () => {
+    const parsed = parseConfigSearchQuery("tag:security");
+    const matched = matchesNodeSearch({
+      schema: schema.properties.gateway,
+      value: {},
+      path: ["gateway"],
+      hints: {
+        "gateway.auth.token": { tags: ["security", "secret"] },
+      },
+      criteria: parsed,
+    });
+    expect(matched).toBe(true);
+  });
+
+  it.each([["mode tag:security", false]])(
+    "requires text and tag when combined in %j",
+    (query, expected) => {
+      expect(
+        matchesNodeSearch({
+          schema: schema.properties.gateway,
+          value: {},
+          path: ["gateway"],
+          hints: {
+            "gateway.auth.token": { label: "Access Token", tags: ["security"] },
+          },
+          criteria: parseConfigSearchQuery(query),
+        }),
+      ).toBe(expected);
+    },
+  );
+
+  it("searches array item schemas before entries exist", () => {
+    const matched = matchesNodeSearch({
+      schema: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            source: {
+              type: "string",
+              description: "Credential source for outgoing requests",
+            },
+          },
+        },
+      },
+      value: [],
+      path: ["headers"],
+      hints: {},
+      criteria: parseConfigSearchQuery("credential source"),
+    });
+
+    expect(matched).toBe(true);
+  });
+
+  it.each(["composed overflow"])("searches %s array schemas declared through allOf", (query) => {
+    const matched = matchesNodeSearch({
+      schema: {
+        type: "array",
+        items: [{ type: "string", description: "Outer endpoint" }],
+        allOf: [
+          {
+            items: [{}, { type: "string", description: "Composed secondary endpoint" }],
+            additionalItems: { type: "string", description: "Composed overflow endpoint" },
+          },
+        ],
+      },
+      value: [],
+      path: ["endpoints"],
+      hints: {},
+      criteria: parseConfigSearchQuery(query),
+    });
+
+    expect(matched).toBe(true);
+  });
+
+  it("does not search tuple positions forbidden by an allOf branch", () => {
+    const matched = matchesNodeSearch({
+      schema: {
+        type: "array",
+        allOf: [
+          {
+            items: [{ type: "string", description: "Reachable endpoint" }],
+            additionalItems: false,
+          },
+          {
+            items: [{}, { type: "string", description: "Impossible endpoint" }],
+          },
+        ],
+      },
+      value: [],
+      path: ["endpoints"],
+      hints: {},
+      criteria: parseConfigSearchQuery("impossible endpoint"),
+    });
+
+    expect(matched).toBe(false);
+  });
+
+  it("searches additional-property schemas before entries exist", () => {
+    const matched = matchesNodeSearch({
+      schema: {
+        type: "object",
+        additionalProperties: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+            },
+          },
+        },
+      },
+      value: {},
+      path: ["servers"],
+      hints: {
+        "servers.*.url": {
+          help: "Endpoint used by the remote service",
+        },
+      },
+      criteria: parseConfigSearchQuery("remote service"),
+    });
+
+    expect(matched).toBe(true);
+  });
+  it.each([
+    { query: "", value: { reserved: "hidden", alpha: "visible" }, keys: ["alpha"], visible: true },
+    {
+      query: "alpha",
+      value: { reserved: "hidden", alpha: "visible" },
+      keys: ["alpha"],
+      visible: true,
+    },
+    {
+      query: "reserved",
+      value: { reserved: "hidden", alpha: "visible" },
+      keys: [],
+      visible: false,
+    },
+    { query: "missing", value: { reserved: "hidden", alpha: "visible" }, keys: [], visible: false },
+    { query: "", value: {}, keys: [], visible: true },
+    { query: "alpha", value: {}, keys: [], visible: false },
+  ])(
+    "keeps custom map visibility scoped to its searchable entries ($query, $visible)",
+    ({ query, value, keys, visible }) => {
+      const result = resolveConfigMapSearch({
+        schema: { type: "string" },
+        value,
+        path: ["settings"],
+        hints: {},
+        reservedKeys: new Set(["reserved"]),
+        searchCriteria: parseConfigSearchQuery(query),
+      });
+      expect(result.visibleEntries.map(([key]) => key)).toEqual(keys);
+      expect(result.visible).toBe(visible);
+    },
+  );
+});
