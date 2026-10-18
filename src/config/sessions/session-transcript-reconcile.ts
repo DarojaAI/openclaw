@@ -41,6 +41,11 @@ import type {
 const log = createSubsystemLogger("sessions/transcript-index");
 const PROJECTION_WRITE_CHUNK_ROWS = 512;
 const PROJECTION_READY_POLL_MS = 10;
+// A reconcile worker stuck in native SQLite (the 2026-10-08 prod RSS
+// incident's "workerMemoryMissing ... pending" signature) never sends done or
+// exits. Gateway startup awaits the reconcile owner, so a wedged worker must
+// settle within a bounded window instead of stalling the owner forever.
+const SESSION_TRANSCRIPT_RECONCILE_TIMEOUT_MS = 5 * 60_000;
 
 type RunningReconcile = {
   pending: boolean;
@@ -57,6 +62,8 @@ export type SessionTranscriptReconcileResult = {
 type SessionTranscriptReconcileParams = OpenClawAgentDatabaseOptions & {
   createWorker?: (filename: string | URL, options: WorkerOptions) => Worker;
   preferredSessionId?: string;
+  /** Worker settlement budget; a hung worker is terminated and the run fails. */
+  timeoutMs?: number;
 };
 
 type ActivePreparedProjection = {
@@ -242,101 +249,107 @@ export async function reconcileSessionTranscriptIndexes(
     throw toStringifiedError(error);
   }
 
-  return new Promise<SessionTranscriptReconcileResult>((resolve, reject) => {
-    let active: ActivePreparedProjection | undefined;
-    let doneReceived = false;
-    let reconciledSessions = 0;
-    let settled = false;
-    const settle = (finish: () => void, terminate: boolean) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      worker.removeAllListeners();
-      if (terminate) {
-        void worker.terminate();
-      }
-      finish();
-    };
-    const handleMessage = async (message: SessionTranscriptReconcileWorkerMessage) => {
-      if (message.type === "failed") {
-        settle(() => reject(new Error(message.error)), false);
-        return;
-      }
-      if (message.type === "done") {
-        doneReceived = true;
-        if (active) {
-          settle(
-            () => reject(new Error("session transcript reconcile worker ended mid-plan")),
-            true,
-          );
-          return;
-        }
-        try {
-          await runProjectionWrite(
-            databaseOptions,
-            "sessions.transcript-index.orphan-sweep",
-            (database) => deleteOrphanedTranscriptIndexRowsInTransaction(database.db),
-          );
-        } catch (error) {
-          settle(() => reject(toStringifiedError(error)), true);
-          return;
-        }
-        settle(() => resolve({ reconciledSessions }), false);
+  const timeoutMs = params.timeoutMs ?? SESSION_TRANSCRIPT_RECONCILE_TIMEOUT_MS;
+  const { promise, resolve, reject } = Promise.withResolvers<SessionTranscriptReconcileResult>();
+  let active: ActivePreparedProjection | undefined;
+  let doneReceived = false;
+  let reconciledSessions = 0;
+  let settled = false;
+  const settle = (finish: () => void, terminate: boolean) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timer);
+    worker.removeAllListeners();
+    if (terminate) {
+      void worker.terminate();
+    }
+    finish();
+  };
+  const timer = setTimeout(() => {
+    settle(
+      () => reject(new Error(`session transcript reconcile worker timed out after ${timeoutMs}ms`)),
+      true,
+    );
+  }, timeoutMs);
+  timer.unref?.();
+  const handleMessage = async (message: SessionTranscriptReconcileWorkerMessage) => {
+    if (message.type === "failed") {
+      settle(() => reject(new Error(message.error)), false);
+      return;
+    }
+    if (message.type === "done") {
+      doneReceived = true;
+      if (active) {
+        settle(() => reject(new Error("session transcript reconcile worker ended mid-plan")), true);
         return;
       }
       try {
-        if (message.type === "plan-start") {
-          if (active) {
-            throw new Error("session transcript reconcile worker started overlapping plans");
-          }
-          active = await claimPreparedSessionTranscriptProjection(databaseOptions, message.plan);
-          continueProjectionWorker(worker, active !== undefined);
-          return;
-        }
-        if (!active || active.plan.sessionId !== message.sessionId) {
-          throw new Error("session transcript reconcile worker sent a chunk for no active plan");
-        }
-        if (message.type === "plan-finish") {
-          const finalized = await finalizePreparedProjection(databaseOptions, active);
-          active = undefined;
-          if (finalized) {
-            reconciledSessions += 1;
-          }
-          continueProjectionWorker(worker, finalized);
-          return;
-        }
-        const owned = await appendPreparedProjectionChunk(
+        await runProjectionWrite(
           databaseOptions,
-          active,
-          message.type === "active-chunk"
-            ? { activeRows: message.rows }
-            : { ftsRows: decodeFtsChunk(message.chunk) },
+          "sessions.transcript-index.orphan-sweep",
+          (database) => deleteOrphanedTranscriptIndexRowsInTransaction(database.db),
         );
-        if (!owned) {
-          active = undefined;
-        }
-        continueProjectionWorker(worker, owned);
       } catch (error) {
         settle(() => reject(toStringifiedError(error)), true);
-      }
-    };
-    worker.on("message", (message: SessionTranscriptReconcileWorkerMessage) => {
-      void handleMessage(message);
-    });
-    worker.once("error", (error) => {
-      settle(() => reject(toStringifiedError(error)), true);
-    });
-    worker.once("exit", (code) => {
-      if (doneReceived && code === 0) {
         return;
       }
-      settle(
-        () => reject(new Error(`session transcript reconcile worker exited with code ${code}`)),
-        false,
+      settle(() => resolve({ reconciledSessions }), false);
+      return;
+    }
+    try {
+      if (message.type === "plan-start") {
+        if (active) {
+          throw new Error("session transcript reconcile worker started overlapping plans");
+        }
+        active = await claimPreparedSessionTranscriptProjection(databaseOptions, message.plan);
+        continueProjectionWorker(worker, active !== undefined);
+        return;
+      }
+      if (!active || active.plan.sessionId !== message.sessionId) {
+        throw new Error("session transcript reconcile worker sent a chunk for no active plan");
+      }
+      if (message.type === "plan-finish") {
+        const finalized = await finalizePreparedProjection(databaseOptions, active);
+        active = undefined;
+        if (finalized) {
+          reconciledSessions += 1;
+        }
+        continueProjectionWorker(worker, finalized);
+        return;
+      }
+      const owned = await appendPreparedProjectionChunk(
+        databaseOptions,
+        active,
+        message.type === "active-chunk"
+          ? { activeRows: message.rows }
+          : { ftsRows: decodeFtsChunk(message.chunk) },
       );
-    });
+      if (!owned) {
+        active = undefined;
+      }
+      continueProjectionWorker(worker, owned);
+    } catch (error) {
+      settle(() => reject(toStringifiedError(error)), true);
+    }
+  };
+  worker.on("message", (message: SessionTranscriptReconcileWorkerMessage) => {
+    void handleMessage(message);
   });
+  worker.once("error", (error) => {
+    settle(() => reject(toStringifiedError(error)), true);
+  });
+  worker.once("exit", (code) => {
+    if (doneReceived && code === 0) {
+      return;
+    }
+    settle(
+      () => reject(new Error(`session transcript reconcile worker exited with code ${code}`)),
+      false,
+    );
+  });
+  return promise;
 }
 
 /** Starts one deferred reconcile. No transcript rows are read on the caller's stack. */
