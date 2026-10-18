@@ -108,7 +108,7 @@ function defaultSpawn(python: string): PreflightGateSpawn {
   return async (args) => {
     try {
       const { stdout, stderr } = await run(python, [...args], { maxBuffer: 1024 * 1024 });
-      return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
+      return { exitCode: 0, stdout, stderr };
     } catch (error) {
       const code =
         typeof error === "object" &&
@@ -119,11 +119,15 @@ function defaultSpawn(python: string): PreflightGateSpawn {
           : 1;
       const stdout =
         typeof error === "object" && error !== null && "stdout" in error
-          ? String(error.stdout ?? "")
+          ? typeof error.stdout === "string"
+            ? error.stdout
+            : ""
           : "";
       const stderr =
         typeof error === "object" && error !== null && "stderr" in error
-          ? String(error.stderr ?? "")
+          ? typeof error.stderr === "string"
+            ? error.stderr
+            : String(error)
           : String(error);
       return { exitCode: code, stdout, stderr };
     }
