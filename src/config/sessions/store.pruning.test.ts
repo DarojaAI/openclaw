@@ -239,6 +239,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
         resetArchiveRetentionMs: null,
         maxDiskBytes: null,
         highWaterBytes: null,
+        historyArchiveCadenceMs: 30 * 60 * 1000,
       },
       log: { warn: () => {}, info: () => {} },
       artifacts: {
@@ -294,6 +295,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
         resetArchiveRetentionMs: 0,
         maxDiskBytes: null,
         highWaterBytes: null,
+        historyArchiveCadenceMs: 30 * 60 * 1000,
       },
       onMaintenanceApplied,
       log: { warn, info: () => {} },
@@ -337,6 +339,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
         resetArchiveRetentionMs: null,
         maxDiskBytes: null,
         highWaterBytes: null,
+        historyArchiveCadenceMs: 30 * 60 * 1000,
       },
       maintenanceOverride: { mode: "enforce" },
       onMaintenanceApplied: (applied) => {
@@ -421,6 +424,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
           resetArchiveRetentionMs: null,
           maxDiskBytes: null,
           highWaterBytes: null,
+          historyArchiveCadenceMs: 30 * 60 * 1000,
         },
         log: { warn: () => {}, info: () => {} },
         artifacts: createMaintenanceArtifacts(),
@@ -452,6 +456,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
       resetArchiveRetentionMs: null,
       maxDiskBytes: null,
       highWaterBytes: null,
+      historyArchiveCadenceMs: 30 * 60 * 1000,
     };
 
     try {

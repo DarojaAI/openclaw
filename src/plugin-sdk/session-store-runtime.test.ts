@@ -835,6 +835,7 @@ describe("session-store-runtime compatibility surface", () => {
           resetArchiveRetentionMs: 7 * DAY_MS,
           maxDiskBytes: null,
           highWaterBytes: null,
+          historyArchiveCadenceMs: 30 * 60 * 1000,
         },
         update: () => ({ model: "gpt-5.5" }),
       }),
@@ -874,6 +875,7 @@ describe("session-store-runtime compatibility surface", () => {
         resetArchiveRetentionMs: 7 * DAY_MS,
         maxDiskBytes: null,
         highWaterBytes: null,
+        historyArchiveCadenceMs: 30 * 60 * 1000,
       },
       requireWriteSuccess: true,
       skipMaintenance: true,
@@ -905,6 +907,7 @@ describe("session-store-runtime compatibility surface", () => {
       resetArchiveRetentionMs: 7 * DAY_MS,
       maxDiskBytes: null,
       highWaterBytes: null,
+      historyArchiveCadenceMs: 30 * 60 * 1000,
     };
 
     await expect(

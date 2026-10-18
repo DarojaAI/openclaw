@@ -94,6 +94,9 @@ export const SessionSchema = z
         resetArchiveRetention: z.union([PositiveDurationSchema, z.literal(false)]).optional(),
         maxDiskBytes: z.union([z.string(), z.number(), z.literal(false)]).optional(),
         highWaterBytes: z.union([z.string(), z.number()]).optional(),
+        historyArchiveCadence: z
+          .union([PositiveDurationSchema, z.literal(false)])
+          .optional(),
       })
       .strict()
       .superRefine((val, ctx) => {

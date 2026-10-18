@@ -115,6 +115,7 @@ export const TARGET_KEYS = [
   "session.maintenance.resetArchiveRetention",
   "session.maintenance.maxDiskBytes",
   "session.maintenance.highWaterBytes",
+  "session.maintenance.historyArchiveCadence",
   "approvals",
   "approvals.exec",
   "approvals.exec.enabled",

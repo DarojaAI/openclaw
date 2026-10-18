@@ -24,6 +24,10 @@ const DEFAULT_MODEL_RUN_PRUNE_AFTER_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SESSION_MAX_ENTRIES = 500;
 const DEFAULT_SESSION_MAINTENANCE_MODE: SessionMaintenanceMode = "enforce";
 const DEFAULT_SESSION_DISK_BUDGET_HIGH_WATER_RATIO = 0.8;
+// How often a per-agent store may run the historical-transcript archive
+// maintenance without explicit pressure/force (aligns with the history-eviction
+// kick throttle). Overrides the hardcoded interval in session-history-eviction.
+const DEFAULT_SESSION_HISTORY_ARCHIVE_CADENCE_MS = 30 * 60 * 1000;
 // Conversation history stays in SQLite until physical main-file + WAL + artifact usage crosses
 // this budget. Cleanup then extracts historical sessions oldest-first before reclaiming rows.
 const DEFAULT_SESSION_MAX_DISK_BYTES = 10 * 1024 * 1024 * 1024;
@@ -49,6 +53,7 @@ export type ResolvedSessionMaintenanceConfig = {
   resetArchiveRetentionMs: number | null;
   maxDiskBytes: number | null;
   highWaterBytes: number | null;
+  historyArchiveCadenceMs: number;
 };
 
 export type ResolvedSessionMaintenanceConfigInput = Omit<
@@ -116,6 +121,27 @@ function resolveMaxDiskBytes(maintenance?: SessionMaintenanceConfig): number | n
   }
 }
 
+function resolveHistoryArchiveCadenceMs(
+  maintenance: SessionMaintenanceConfig | undefined,
+): number {
+  // The cadence bounds how often a per-agent store runs the historical-transcript
+  // archive maintenance without explicit pressure/force. A malformed or absent
+  // value keeps the built-in throttle; `false` disables the automatic cadence.
+  const raw = maintenance?.historyArchiveCadence;
+  if (raw === false) {
+    return 0;
+  }
+  const normalized = normalizeStringifiedOptionalString(raw);
+  if (!normalized) {
+    return DEFAULT_SESSION_HISTORY_ARCHIVE_CADENCE_MS;
+  }
+  try {
+    return parseDurationMs(normalized, { defaultUnit: "d" });
+  } catch {
+    return DEFAULT_SESSION_HISTORY_ARCHIVE_CADENCE_MS;
+  }
+}
+
 function resolveHighWaterBytes(
   maintenance: SessionMaintenanceConfig | undefined,
   maxDiskBytes: number | null,
@@ -168,6 +194,7 @@ export function resolveMaintenanceConfigFromInput(
     resetArchiveRetentionMs: resolveResetArchiveRetentionMs(maintenance),
     maxDiskBytes,
     highWaterBytes: resolveHighWaterBytes(maintenance, maxDiskBytes),
+    historyArchiveCadenceMs: resolveHistoryArchiveCadenceMs(maintenance),
   };
 }
 

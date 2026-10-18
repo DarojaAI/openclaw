@@ -342,6 +342,37 @@ export async function pruneSessionTranscriptArchivesToHighWater(params: {
   return { removedFiles, usage };
 }
 
+/**
+ * Removes retained transcript archives (`.deleted.`/`.reset.`) older than the
+ * wall-clock retention window. This is the transcript-archive maxAgeDays knob:
+ * it bounds how long extracted historical transcripts survive even when the
+ * disk budget is not under pressure, so a long-lived VM does not re-accumulate
+ * unbounded archive rows between doctor/deploy passes.
+ */
+export async function pruneSessionTranscriptArchivesToRetention(params: {
+  retentionMs: number;
+  storePath: string;
+  nowMs?: number;
+}): Promise<{ removedFiles: number }> {
+  if (params.retentionMs <= 0) {
+    return { removedFiles: 0 };
+  }
+  const cutoffMs = (params.nowMs ?? Date.now()) - params.retentionMs;
+  const files = (await readSessionsDirFiles(path.dirname(params.storePath))).filter((file) =>
+    isRetainedSessionTranscriptArchiveName(file.name),
+  );
+  let removedFiles = 0;
+  for (const file of files) {
+    if (file.mtimeMs > cutoffMs) {
+      continue;
+    }
+    if ((await removeFileIfExists(file.path)) > 0) {
+      removedFiles += 1;
+    }
+  }
+  return { removedFiles };
+}
+
 async function readSessionPromptBlobFiles(sessionsDir: string): Promise<SessionsDirFileStat[]> {
   const root = path.join(sessionsDir, "skills-prompts", "sha256");
   const prefixEntries = await fs.promises.readdir(root, { withFileTypes: true }).catch(() => []);

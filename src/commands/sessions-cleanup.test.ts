@@ -97,6 +97,7 @@ describe("sessionsCleanupCommand", () => {
       resetArchiveRetentionMs: 7 * 24 * 60 * 60 * 1000,
       maxDiskBytes: null,
       highWaterBytes: null,
+      historyArchiveCadenceMs: 30 * 60 * 1000,
     });
     mocks.pruneStaleEntries.mockImplementation(
       (
@@ -174,6 +175,7 @@ describe("sessionsCleanupCommand", () => {
       freedBytes: 300,
       maxBytes: 900,
       highWaterBytes: 700,
+      historyArchiveCadenceMs: 30 * 60 * 1000,
       overBudget: true,
     });
   });
@@ -206,6 +208,7 @@ describe("sessionsCleanupCommand", () => {
             freedBytes: 400,
             maxBytes: 1000,
             highWaterBytes: 800,
+            historyArchiveCadenceMs: 30 * 60 * 1000,
             overBudget: true,
           },
           wouldMutate: true,
@@ -246,6 +249,7 @@ describe("sessionsCleanupCommand", () => {
         freedBytes: 400,
         maxBytes: 1000,
         highWaterBytes: 800,
+        historyArchiveCadenceMs: 30 * 60 * 1000,
         overBudget: true,
       },
       wouldMutate: true,
@@ -368,6 +372,7 @@ describe("sessionsCleanupCommand", () => {
               freedBytes: 300,
               maxBytes: 900,
               highWaterBytes: 700,
+              historyArchiveCadenceMs: 30 * 60 * 1000,
               overBudget: true,
             },
             wouldMutate: true,
@@ -414,6 +419,7 @@ describe("sessionsCleanupCommand", () => {
         freedBytes: 300,
         maxBytes: 900,
         highWaterBytes: 700,
+        historyArchiveCadenceMs: 30 * 60 * 1000,
         overBudget: true,
       },
       wouldMutate: true,

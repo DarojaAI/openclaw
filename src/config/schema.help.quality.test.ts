@@ -247,6 +247,7 @@ describe("config help copy quality", () => {
         ["session.maintenance.resetArchiveRetention", [".reset.", /false/i]],
         ["session.maintenance.maxDiskBytes", ["500mb"]],
         ["session.maintenance.highWaterBytes", ["80%"]],
+        ["session.maintenance.historyArchiveCadence", ["30m", "6h", /false/i]],
       ],
     },
     {

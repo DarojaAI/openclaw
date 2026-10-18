@@ -14,6 +14,7 @@ import {
   hasRetainedSessionTranscriptArchives,
   measureSessionPhysicalDiskUsage,
   pruneSessionTranscriptArchivesToHighWater,
+  pruneSessionTranscriptArchivesToRetention,
   type SessionDiskBudgetSweepResult,
   type SessionPhysicalDiskUsage,
 } from "./disk-budget.js";
@@ -41,7 +42,13 @@ type SessionHistoryDiskBudgetParams = {
   agentId?: string;
   mode: ResolvedSessionMaintenanceConfig["mode"];
   storePath: string;
-  maintenance: Pick<ResolvedSessionMaintenanceConfig, "highWaterBytes" | "maxDiskBytes">;
+  maintenance: Pick<ResolvedSessionMaintenanceConfig, "highWaterBytes" | "maxDiskBytes"> &
+    Partial<
+      Pick<
+        ResolvedSessionMaintenanceConfig,
+        "resetArchiveRetentionMs" | "historyArchiveCadenceMs"
+      >
+    >;
 };
 
 function createPhysicalBudgetResult(params: {
@@ -195,7 +202,7 @@ function reclaimSqliteFreePages(database: OpenClawAgentDatabase): void {
   database.walMaintenance.checkpoint();
 }
 
-const PHYSICAL_BUDGET_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+const DEFAULT_PHYSICAL_BUDGET_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 // Single-slot per store: ordinary entry writes kick a throttled background
 // budget pass so an over-budget database self-heals without waiting for a
 // manual `sessions cleanup` invocation.
@@ -242,7 +249,12 @@ export function kickSessionHistoryDiskBudgetMaintenance(params: {
     budgetKickStateByStore.set(params.storePath, state);
     return;
   }
-  if (!params.force && now - state.lastCheckAt < PHYSICAL_BUDGET_CHECK_INTERVAL_MS) {
+  const cadenceMs = maintenance.historyArchiveCadenceMs ?? DEFAULT_PHYSICAL_BUDGET_CHECK_INTERVAL_MS;
+  if (
+    !params.force &&
+    cadenceMs > 0 &&
+    now - state.lastCheckAt < cadenceMs
+  ) {
     // Dropped, not deferred: every entry write (including heartbeats) re-kicks,
     // so a store that goes over budget is rechecked on the next activity.
     // Reset/delete use force and bypass this window entirely.
@@ -297,6 +309,26 @@ async function enforceSessionHistoryMaintenanceSerialized(
   if (maxDiskBytes == null || highWaterBytes == null) {
     return null;
   }
+
+  const resolved = resolveSqliteScope({
+    ...(params.agentId ? { agentId: params.agentId } : {}),
+    sessionKey: "",
+    storePath: params.storePath,
+  });
+  const retentionMs = params.maintenance.resetArchiveRetentionMs;
+  // The transcript-archive retention window (maxAgeDays) is wall-clock, not
+  // byte-pressure, so age out retained `.deleted.`/`.reset.` archives even when
+  // the disk budget is satisfied. Watch the archives write lane so this cannot
+  // race a concurrent reset/delete archive commit.
+  if (retentionMs != null) {
+    await runExclusiveSqliteSessionWrite(resolved, () =>
+      pruneSessionTranscriptArchivesToRetention({
+        retentionMs,
+        storePath: params.storePath,
+      }),
+    );
+  }
+
   const initialUsage = await measureSessionPhysicalDiskUsage(params.storePath);
   if (initialUsage.totalBytes <= maxDiskBytes || params.mode === "warn") {
     return createPhysicalBudgetResult({
@@ -305,12 +337,6 @@ async function enforceSessionHistoryMaintenanceSerialized(
       highWaterBytes,
     });
   }
-
-  const resolved = resolveSqliteScope({
-    ...(params.agentId ? { agentId: params.agentId } : {}),
-    sessionKey: "",
-    storePath: params.storePath,
-  });
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
   const archiveDirectory = resolveSqliteTranscriptArchiveDirectory(resolved);
   let usage: SessionPhysicalDiskUsage = await runExclusiveSqliteSessionWrite(resolved, async () => {

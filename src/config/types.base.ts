@@ -266,6 +266,14 @@ export type SessionMaintenanceConfig = {
    */
   maxDiskBytes?: number | string | false;
   /**
+   * Minimum interval between automatic historical-transcript archive passes per
+   * agent store (e.g. "30m", "6h"). Default: "30m"; `false` disables automatic
+   * archive cadence (maintenance only runs on explicit pressure or sessions
+   * cleanup). A shorter cadence bounds how quickly a long-lived VM re-accumulates
+   * archive rows between doctor/deploy passes.
+   */
+  historyArchiveCadence?: string | number | false;
+  /**
    * Target size after disk-budget cleanup (high-water mark), e.g. "400mb".
    * Default: 80% of maxDiskBytes.
    */
