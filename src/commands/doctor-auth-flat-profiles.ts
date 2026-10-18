@@ -99,13 +99,12 @@ import {
 } from "./doctor-auth-legacy-paths.js";
 import {
   acquireAuthProfileMigrationSourceLocks,
-  archiveAuthProfileMigrationSource,
+  archiveOrCleanupReappearedAuthProfileSource,
   prepareAuthProfileSourceReceipt,
   parseAuthProfileMigrationSource,
   assertAuthProfileMigrationSourcesUnchanged,
   digestAuthProfileMigrationValue,
   finalizeAuthProfileMigrationSource,
-  hasTerminalAuthProfileMigrationReceipt,
   resumePendingAuthProfileMigrationArchives,
   type AuthProfileMigrationSourceReceipt,
 } from "./doctor-auth-migration-receipts.js";
@@ -539,13 +538,11 @@ function archivePreviouslyMigratedAuthProfileSource(
   receipt: AuthProfileMigrationSourceReceipt,
   result: LegacyFlatAuthProfileRepairResult,
 ): boolean {
-  if (!hasTerminalAuthProfileMigrationReceipt(receipt.sourceKey, receipt.env)) {
+  const change = archiveOrCleanupReappearedAuthProfileSource(receipt);
+  if (!change) {
     return false;
   }
-  archiveAuthProfileMigrationSource(receipt);
-  result.changes.push(
-    `Archived a previously migrated legacy auth source without replaying credentials (${shortenHomePath(receipt.archivePath)}).`,
-  );
+  result.changes.push(change);
   return true;
 }
 

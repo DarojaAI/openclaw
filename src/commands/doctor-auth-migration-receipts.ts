@@ -21,6 +21,7 @@ import {
 import { withExistingOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
 import type { DB as OpenClawStateDatabase } from "../state/openclaw-state-db.generated.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
+import { shortenHomePath } from "../utils.js";
 
 const MIGRATION_KIND = "auth-profile-json-to-sqlite-v2";
 type MigrationDatabase = Pick<OpenClawStateDatabase, "migration_runs" | "migration_sources">;
@@ -489,22 +490,57 @@ export function resumePendingAuthProfileMigrationArchives(
   return changes;
 }
 
-export function hasTerminalAuthProfileMigrationReceipt(
+export function findTerminalAuthProfileMigrationReceipt(
   sourceKey: string,
   env?: NodeJS.ProcessEnv,
-): boolean {
+): { archivePath: string } | null {
   const row = withExistingOpenClawStateDatabaseReadOnly(
     ({ db }) =>
       executeSqliteQueryTakeFirstSync(
         db,
         getNodeSqliteKysely<MigrationDatabase>(db)
           .selectFrom("migration_sources")
-          .select("status")
+          .select(["status", "report_json"])
           .where("source_key", "=", sourceKey),
       ),
     { env },
   );
-  return row?.status === "completed" || row?.status === "archived-unparsed";
+  if (row?.status !== "completed" && row?.status !== "archived-unparsed") {
+    return null;
+  }
+  const report =
+    typeof row.report_json === "string" ? (JSON.parse(row.report_json) as unknown) : null;
+  return isRecord(report) && typeof report.archivePath === "string"
+    ? { archivePath: report.archivePath }
+    : null;
+}
+
+/**
+ * A reappeared legacy auth source already owned by a terminal migration receipt
+ * must not mint another timestamped archive on every doctor pass. Remove the
+ * source without a new snapshot when its terminal archive still preserves the
+ * verified bytes; only re-archive when that archive is missing.
+ *
+ * Returns the change message to surface, or null when no terminal receipt owns
+ * the source.
+ */
+export function archiveOrCleanupReappearedAuthProfileSource(
+  receipt: AuthProfileMigrationSourceReceipt,
+): string | null {
+  const terminal = findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, receipt.env);
+  if (!terminal) {
+    return null;
+  }
+  if (fs.existsSync(terminal.archivePath)) {
+    const currentSha256 = sha256Hex(fs.readFileSync(receipt.sourcePath));
+    if (currentSha256 !== receipt.sourceSha256) {
+      throw new Error("legacy auth source changed after verification");
+    }
+    fs.rmSync(receipt.sourcePath);
+    return `Removed a reappeared already-migrated legacy auth source without a new snapshot (bytes already archived at ${shortenHomePath(terminal.archivePath)}).`;
+  }
+  archiveAuthProfileMigrationSource(receipt);
+  return `Archived a previously migrated legacy auth source without replaying credentials (${shortenHomePath(receipt.archivePath)}).`;
 }
 
 if (process.env.VITEST || process.env.NODE_ENV === "test") {

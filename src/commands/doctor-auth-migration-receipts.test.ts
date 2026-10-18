@@ -15,6 +15,7 @@ import {
   prepareAuthProfileSourceReceipt,
   digestAuthProfileMigrationValue,
   finalizeAuthProfileMigrationSource,
+  findTerminalAuthProfileMigrationReceipt,
   resumePendingAuthProfileMigrationArchives,
 } from "./doctor-auth-migration-receipts.js";
 
@@ -176,5 +177,21 @@ describe("auth profile migration receipts", () => {
       .db.prepare("SELECT status FROM migration_sources WHERE source_key = ?")
       .get(receipt.sourceKey);
     expect(row).toEqual({ status: "archived-unparsed" });
+  });
+
+  it("returns the recorded terminal archive path only after completion", async () => {
+    const { state, sourcePath, receipt } = await makeReceipt();
+
+    expect(findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, state.env)).toBeNull();
+
+    recordAuthProfileMigrationImported(receipt);
+    expect(findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, state.env)).toBeNull();
+
+    finalizeAuthProfileMigrationSource(receipt);
+    expect(fs.existsSync(sourcePath)).toBe(false);
+
+    expect(findTerminalAuthProfileMigrationReceipt(receipt.sourceKey, state.env)).toEqual({
+      archivePath: receipt.archivePath,
+    });
   });
 });
