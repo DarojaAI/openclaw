@@ -518,8 +518,9 @@ export function findTerminalAuthProfileMigrationReceipt(
 /**
  * A reappeared legacy auth source already owned by a terminal migration receipt
  * must not mint another timestamped archive on every doctor pass. Remove the
- * source without a new snapshot when its terminal archive still preserves the
- * verified bytes; only re-archive when that archive is missing.
+ * source without a new snapshot only when the terminal archive still preserves
+ * the verified bytes; re-archive when that archive is missing, corrupt, or
+ * unreadable so the only intact copy is never deleted.
  *
  * Returns the change message to surface, or null when no terminal receipt owns
  * the source.
@@ -536,8 +537,20 @@ export function archiveOrCleanupReappearedAuthProfileSource(
     if (currentSha256 !== receipt.sourceSha256) {
       throw new Error("legacy auth source changed after verification");
     }
-    fs.rmSync(receipt.sourcePath);
-    return `Removed a reappeared already-migrated legacy auth source without a new snapshot (bytes already archived at ${shortenHomePath(terminal.archivePath)}).`;
+    let archiveBytes: Buffer;
+    try {
+      archiveBytes = fs.readFileSync(terminal.archivePath);
+    } catch {
+      archiveBytes = Buffer.alloc(0);
+    }
+    if (sha256Hex(archiveBytes) === receipt.sourceSha256) {
+      fs.rmSync(receipt.sourcePath);
+      return `Removed a reappeared already-migrated legacy auth source without a new snapshot (bytes already archived at ${shortenHomePath(terminal.archivePath)}).`;
+    }
+    // The retained terminal archive no longer preserves the recorded bytes
+    // (truncated, replaced, or unreadable): removing the source would destroy
+    // the only intact copy of the original credentials, so fall through and
+    // preserve it through the normal archival path instead.
   }
   archiveAuthProfileMigrationSource(receipt);
   return `Archived a previously migrated legacy auth source without replaying credentials (${shortenHomePath(receipt.archivePath)}).`;
