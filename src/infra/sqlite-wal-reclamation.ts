@@ -70,19 +70,36 @@ export function readSqliteFreePageCount(
   }
 }
 
+export type SqliteAutoVacuumReclamationState = {
+  /** `auto_vacuum` pragma mode: 0 NONE, 1 FULL, 2 INCREMENTAL (2 when N/A). */
+  autoVacuumMode: number;
+  /** Acknowledged freelist page count; 0 when the connection is not a SQLite store. */
+  freePages: number;
+  /**
+   * True when this legacy store keeps every deleted page in the freelist and
+   * must be converted (`PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`) by
+   * Doctor's OFFLINE sqlite reclamation. Online maintenance must never run
+   * that full synchronous VACUUM on the foreground writer path.
+   */
+  requiresOfflineDoctorConversion: boolean;
+};
+
 /**
- * Reclaim freelist pages on a legacy store that never received the doctor
- * `auto_vacuum=INCREMENTAL` retrofit. Such stores keep every deleted page in
- * the freelist and incremental vacuum is a no-op for them, so flip the header
- * and VACUUM once before running incremental reclamation. Best-effort: returns
- * the acknowledged free page count, or 0 when there is nothing to reclaim.
+ * Inspect-only reclamation eligibility. Conversion of a legacy
+ * `auto_vacuum=NONE` store is owned by Doctor's offline sqlite reclamation
+ * flow (readers and writers drained, temp-space verified), so this function
+ * only reports the mode and freelist instead of mutating the store. Online
+ * maintenance reclaims freelist pages exclusively through the checkpoint-gated
+ * reclaimer on stores already running `auto_vacuum=INCREMENTAL`.
  */
-export function retrofitSqliteAutoVacuumAndReclaim(database: EngineConnection): number {
+export function readSqliteAutoVacuumReclamationState(
+  database: EngineConnection,
+): SqliteAutoVacuumReclamationState {
   if (isPostgresSqlConnection(database)) {
-    return 0;
+    return { autoVacuumMode: 2, freePages: 0, requiresOfflineDoctorConversion: false };
   }
-  // PRAGMA returns a bare row object with no static schema; the
-  // freelist count is re-validated via Number before use.
+  // PRAGMA returns a bare row object with no static schema; the values are
+  // re-validated via Number before use.
   const freeRow =
     // sqlite-allow-raw -- Physical page accounting belongs to the WAL owner.
     // SAFETY: PRAGMA rows are driver objects; only the numeric field is used.
@@ -94,24 +111,13 @@ export function retrofitSqliteAutoVacuumAndReclaim(database: EngineConnection): 
     // sqlite-allow-raw -- auto_vacuum mode inspection belongs to the WAL owner.
     // SAFETY: only the numeric auto_vacuum mode is read.
     database.prepare("PRAGMA auto_vacuum").get() as { auto_vacuum?: unknown } | undefined;
-  if (!Number.isSafeInteger(freePages) || freePages <= 0) {
-    return 0;
-  }
-  // SAFETY: header flip plus full VACUUM is the owner's retrofit for legacy
-  // stores; owning callers run it inside their serialized writer window. Mode 2
-  // (`INCREMENTAL`) is what enables online page reclamation.
-  if (Number(vacuumRow?.auto_vacuum ?? 0) !== 2) {
-    // sqlite-allow-raw -- Legacy auto_vacuum header flip is owned maintenance.
-    database.exec("PRAGMA auto_vacuum = INCREMENTAL;");
-    // sqlite-allow-raw -- Full VACUUM retrofit for legacy stores is owned maintenance.
-    database.exec("VACUUM;");
-  } else {
-    // SAFETY: incremental vacuum is the owner's bounded online reclamation for
-    // stores already running auto_vacuum=INCREMENTAL.
-    // sqlite-allow-raw -- Bounded physical maintenance within its admitted window.
-    database.exec(`PRAGMA incremental_vacuum(${freePages});`);
-  }
-  return freePages;
+  const autoVacuumMode = Number(vacuumRow?.auto_vacuum ?? 0);
+  const acknowledgedFreePages = Number.isSafeInteger(freePages) && freePages > 0 ? freePages : 0;
+  return {
+    autoVacuumMode,
+    freePages: acknowledgedFreePages,
+    requiresOfflineDoctorConversion: autoVacuumMode !== 2 && acknowledgedFreePages > 0,
+  };
 }
 
 /** One online unit never waits for readers or adds vacuum frames behind a blocked checkpoint. */

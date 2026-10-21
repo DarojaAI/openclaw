@@ -31,7 +31,12 @@ export function createPhysicalBudgetResult(params: {
   maxBytes: number;
   highWaterBytes: number;
   walBytesAfter?: number;
-  deferred?: { checkpoint?: SqliteWalHealth; walBytesBefore: number; walBytesAfter: number };
+  deferred?: {
+    reason?: "checkpoint-incomplete" | "doctor-retrofit-required";
+    checkpoint?: SqliteWalHealth;
+    walBytesBefore: number;
+    walBytesAfter: number;
+  };
 }): SessionDiskBudgetSweepResult {
   const totalBytesAfter = params.totalBytesAfter ?? params.totalBytesBefore;
   return {
@@ -46,8 +51,12 @@ export function createPhysicalBudgetResult(params: {
     ...(params.walBytesAfter !== undefined ? { walBytesAfter: params.walBytesAfter } : {}),
     ...(params.deferred
       ? {
-          deferredReason: "checkpoint-incomplete" as const,
-          ...params.deferred,
+          deferredReason: params.deferred.reason ?? ("checkpoint-incomplete" as const),
+          ...(params.deferred.checkpoint !== undefined
+            ? { checkpoint: params.deferred.checkpoint }
+            : {}),
+          walBytesBefore: params.deferred.walBytesBefore,
+          walBytesAfter: params.deferred.walBytesAfter,
         }
       : {}),
   };
@@ -163,6 +172,18 @@ export function recordPhysicalBudgetOutcome(
   const state = getBudgetKickState(params.storePath, params.maintenance);
   if (result.deferredReason) {
     state.protected = undefined;
+    if (result.deferredReason === "doctor-retrofit-required") {
+      log.warn(
+        "session history disk budget deferred: legacy store needs Doctor's offline SQLite reclamation",
+        {
+          storePath: params.storePath,
+          reason: result.deferredReason,
+          totalBytesBefore: result.totalBytesBefore,
+          totalBytesAfter: result.totalBytesAfter,
+        },
+      );
+      return;
+    }
     if (state.checkpointBlocked?.warned) {
       return;
     }

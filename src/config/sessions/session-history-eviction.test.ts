@@ -885,7 +885,7 @@ describe("SQLite historical session disk budget", () => {
     expect(readArchiveNames("old-history")).toHaveLength(0);
   });
 
-  it("reclaims pages after archiving, retrofitting legacy databases to incremental auto-vacuum", async () => {
+  it("defers reclamation of legacy auto_vacuum=NONE stores to Doctor instead of an online VACUUM", async () => {
     const sessionKey = "agent:main:age-vacuum";
     await createHistoricalTranscript({
       content: "old vacuum " + "z".repeat(64 * 1024),
@@ -905,6 +905,10 @@ describe("SQLite historical session disk budget", () => {
     owner.db.exec("PRAGMA auto_vacuum = NONE;");
     owner.db.exec("VACUUM;");
     const beforeSize = fs.statSync(dbPath).size;
+    const beforePages = Number(
+      (owner.db.prepare("PRAGMA page_count").get() as { page_count?: unknown } | undefined)
+        ?.page_count ?? 0,
+    );
 
     const result = await enforceSqliteSessionHistoryDiskBudget({
       storePath,
@@ -918,9 +922,18 @@ describe("SQLite historical session disk budget", () => {
     const vacuumRow = owner.db.prepare("PRAGMA auto_vacuum").get() as
       | { auto_vacuum?: unknown }
       | undefined;
-    // The post-archive pass must retrofit INCREMENTAL so future removals are
-    // reclaimable incrementally.
-    expect(Number(vacuumRow?.auto_vacuum ?? 0)).toBe(2);
-    expect(fs.statSync(dbPath).size).toBeLessThan(beforeSize);
+    // The maintenance pass must NOT flip the header or run the full synchronous
+    // VACUUM on the foreground writer path; the header stays NONE and the page
+    // count is untouched (a full VACUUM would repack and shrink it), so
+    // Doctor's offline sqlite reclamation owns the conversion.
+    expect(Number(vacuumRow?.auto_vacuum ?? 0)).toBe(0);
+    const afterPages = Number(
+      (owner.db.prepare("PRAGMA page_count").get() as { page_count?: unknown } | undefined)
+        ?.page_count ?? 0,
+    );
+    expect(afterPages).toBe(beforePages);
+    expect(result?.deferredReason).toBe("doctor-retrofit-required");
+    expect(beforePages).toBeGreaterThan(0);
+    expect(beforeSize).toBeGreaterThan(0);
   });
 });

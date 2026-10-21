@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   normalizeResolvedMaintenanceConfigInput,
   resolveMaintenanceConfigFromInput,
+  type ResolvedSessionMaintenanceConfigInput,
 } from "./store-maintenance.js";
 
 describe("session maintenance archiveAfter resolution", () => {
@@ -30,5 +31,21 @@ describe("session maintenance archiveAfter resolution", () => {
     expect(normalizeResolvedMaintenanceConfigInput(full).archiveAfterMs).toBe(
       30 * 24 * 60 * 60 * 1000,
     );
+  });
+
+  it("accepts an omitted archiveAfterMs at the input boundary and normalizes it to null", () => {
+    // Public SDK patchSessionEntry callers opt out of age-driven archival by
+    // omitting the key; the input boundary must not force it on them, and the
+    // normalized resolved config must treat the omission as disabled.
+    const input: ResolvedSessionMaintenanceConfigInput = {
+      mode: "enforce",
+      pruneAfterMs: 30 * 24 * 60 * 60 * 1000,
+      maxEntries: 5000,
+      resetArchiveRetentionMs: null,
+      maxDiskBytes: 10 * 1024 * 1024 * 1024,
+      highWaterBytes: 8 * 1024 * 1024 * 1024,
+    };
+    expect(input.archiveAfterMs).toBeUndefined();
+    expect(normalizeResolvedMaintenanceConfigInput(input).archiveAfterMs).toBeNull();
   });
 });

@@ -53,10 +53,13 @@ export type ResolvedSessionMaintenanceConfig = {
 
 export type ResolvedSessionMaintenanceConfigInput = Omit<
   ResolvedSessionMaintenanceConfig,
-  "archiveDashboardAfterMs" | "modelRunPruneAfterMs"
+  "archiveDashboardAfterMs" | "modelRunPruneAfterMs" | "archiveAfterMs"
 > &
   Partial<
-    Pick<ResolvedSessionMaintenanceConfig, "archiveDashboardAfterMs" | "modelRunPruneAfterMs">
+    Pick<
+      ResolvedSessionMaintenanceConfig,
+      "archiveDashboardAfterMs" | "modelRunPruneAfterMs" | "archiveAfterMs"
+    >
   >;
 
 function resolveMaintenanceDuration(raw: unknown, fallback: number): number;
@@ -177,6 +180,10 @@ export function normalizeResolvedMaintenanceConfigInput(
         : maintenance.archiveDashboardAfterMs,
     modelRunPruneAfterMs: maintenance.modelRunPruneAfterMs ?? DEFAULT_MODEL_RUN_PRUNE_AFTER_MS,
     preserveRecentMs: maintenance.preserveRecentMs ?? null,
+    // SDK patchSessionEntry callers may omit age-driven archival entirely; an
+    // omitted archiveAfterMs means disabled (pressure-only archival), matching
+    // an explicit `false` or an absent `archiveAfter` config key.
+    archiveAfterMs: maintenance.archiveAfterMs ?? null,
   };
 }
 

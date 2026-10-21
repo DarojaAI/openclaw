@@ -10,7 +10,13 @@ export type SessionDiskBudgetSweepResult = {
   maxBytes: number;
   highWaterBytes: number;
   overBudget: boolean;
-  deferredReason?: "checkpoint-incomplete";
+  /**
+   * Why this pass stopped short of reclaiming everything it identified:
+   * `"checkpoint-incomplete"` defers until a completed WAL checkpoint is
+   * observed; `"doctor-retrofit-required"` means a legacy `auto_vacuum=NONE`
+   * store must be converted offline by Doctor's sqlite reclamation.
+   */
+  deferredReason?: "checkpoint-incomplete" | "doctor-retrofit-required";
   checkpoint?: SqliteWalHealth;
   walBytesBefore?: number;
   walBytesAfter?: number;

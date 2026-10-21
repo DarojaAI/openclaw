@@ -1,10 +1,18 @@
+import { iterateProjectedAgentRunSessionKeys } from "../../infra/agent-run-projection.js";
+import { buildProjectedAgentRunIndex } from "../../infra/agent-run-registry.js";
 import { engineTextHexSql } from "../../infra/database-engine/text-bytes.js";
 import {
   executeSqliteQuerySync,
   iterateSqliteQuerySync,
   sqliteStringSet,
 } from "../../infra/kysely-sync.js";
-import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import { collectSessionControllerTargets } from "../../sessions/session-controller.lifecycle.js";
+import {
+  openOpenClawAgentDatabase,
+  type OpenClawAgentDatabase,
+  type OpenClawAgentDatabaseOptions,
+} from "../../state/openclaw-agent-db.js";
+import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import type {
   ArchivedSessionEvictionBatch,
   ArchivedSessionEvictionQuery,
@@ -14,7 +22,10 @@ import { readReferencedSessionIds } from "./session-accessor.sqlite-lifecycle-st
 import { collectSessionStateIdsForEntry } from "./session-accessor.sqlite-references.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import { parseSessionEntryJson } from "./session-accessor.sqlite-status.js";
+import { withSqliteMutationWorkerLifetime } from "./session-accessor.sqlite-worker-request.js";
 import { sessionEntrySnapshotColumns } from "./session-entry-snapshots.js";
+import { maintenanceLane } from "./session-transcript-worker-resources.js";
+import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
 import { isSessionEntryDiskBudgetEvictable } from "./store-maintenance.js";
 
@@ -192,4 +203,67 @@ export function readHistoricalSessionIdsInDatabase(params: {
   return executeSqliteQuerySync(database.db, query).rows.flatMap((row) =>
     protectedSessionIds.has(row.session_id) ? [] : [row.session_id],
   );
+}
+
+/**
+ * Wall-clock / admission-filtered historical generation read. Runs in the
+ * history maintenance lane unless the caller explicitly opts into the
+ * in-process reader.
+ */
+export async function readHistoricalSessionIds(params: {
+  databaseOptions: OpenClawAgentDatabaseOptions;
+  preserveRecentMs?: number | null;
+  /** Wall-clock cutoff (epoch ms); only generations last updated before it qualify. */
+  cutoffMs?: number | null;
+  reclamationMode?: "worker" | "in-process";
+  storePath: string;
+}): Promise<string[]> {
+  const input = {
+    admissionIdentities: [
+      ...(collectSessionControllerTargets(undefined, params.storePath).get(params.storePath) ?? []),
+      ...iterateProjectedAgentRunSessionKeys(buildProjectedAgentRunIndex()),
+    ],
+    preserveRecentMs: params.preserveRecentMs,
+    ...(params.cutoffMs != null ? { cutoffMs: params.cutoffMs } : {}),
+  };
+  if (params.reclamationMode === "in-process") {
+    return readHistoricalSessionIdsInDatabase({
+      ...input,
+      database: openOpenClawAgentDatabase(params.databaseOptions),
+    });
+  }
+  return withSessionHistoryWorkerDatabase(
+    params.databaseOptions,
+    (owner) =>
+      owner.readHistoricalEvictionCandidates({
+        ...input,
+        env: params.databaseOptions.env ?? process.env,
+      }),
+    maintenanceLane,
+  );
+}
+
+/** Archived (reset/deleted) session entry candidates evictable under pressure. */
+export async function readDiskEvictableArchivedSessionBatch({
+  databaseOptions,
+  ...query
+}: Omit<ArchivedSessionEvictionQuery, "liveSessionKeys"> & {
+  databaseOptions: OpenClawAgentDatabaseOptions;
+}): Promise<ArchivedSessionEvictionBatch> {
+  const archived = {
+    ...query,
+    liveSessionKeys: [...iterateProjectedAgentRunSessionKeys(buildProjectedAgentRunIndex())],
+  };
+  const options = { ...databaseOptions, path: resolveOpenClawAgentSqlitePath(databaseOptions) };
+  return withSqliteMutationWorkerLifetime(options, async ({ assertCurrent }) => {
+    assertCurrent();
+    const batch = await withSessionHistoryWorkerDatabase(
+      options,
+      (owner) =>
+        owner.readArchivedEvictionCandidates({ archived, env: options.env ?? process.env }),
+      maintenanceLane,
+    );
+    assertCurrent();
+    return batch;
+  });
 }
