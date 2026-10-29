@@ -32,6 +32,7 @@ import type { CreateChannelReplyPipelineParams } from "../message/reply-pipeline
 import type { MessageReceipt } from "../message/types.js";
 import type { InboundLastRouteUpdate, RecordInboundSession } from "../session.types.js";
 import type { ChannelBotLoopProtectionFacts } from "./bot-loop-protection.js";
+import type { BeforeRouteInboundMessageTurnOptions } from "./preflight-gate-contract.js";
 
 export type { SupplementalContextFacts } from "../../auto-reply/templating.js";
 
@@ -508,4 +509,11 @@ export type RunChannelTurnParams<
   log?: (event: ChannelTurnLogEvent) => void;
   /** Canonical adoption lifecycle for this turn. */
   turnAdoptionLifecycle?: TurnAdoptionLifecycle;
+  /**
+   * Optional `before_route_inbound_message` pre-route gate wiring (preflight-v1
+   * contract). When present, the preflight gate runs between the preflight
+   * stage and session/agent routing; a non-zero gate exit blocks the invocation
+   * (fail-closed). See docs/contracts/preflight-v1.md.
+   */
+  beforeRouteInboundMessage?: BeforeRouteInboundMessageTurnOptions;
 };
